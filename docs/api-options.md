@@ -1,6 +1,6 @@
 # API Options
 
-The prototype patch currently leans toward an ioctl on `/dev/hbfctl`. That is reasonable for RFC isolation, but it is not a commitment that the long-term upstream form should remain a char device.
+The updated prototype patch uses an ioctl on `/dev/hbfctl` only as an RFC frontend. That is acceptable for isolation, but it is not a commitment that the long-term upstream form should remain a char device.
 
 ## Comparison
 
@@ -71,6 +71,7 @@ A very credible conservative path is to add only observability around migration,
 ## Recommendation
 
 Start with a char device or miscdevice only for RFC isolation.
+Keep the real design center in `mm/`, CXL, DAX, and memory-tier policy rather than a driver-first subsystem story.
 
 But be explicit that the long-term upstream form may be:
 

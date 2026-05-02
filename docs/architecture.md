@@ -6,6 +6,8 @@ The proposed HBF control plane is not a claim that Linux already has an HBF subs
 
 The central idea is simple: the runtime knows semantic intent before hardware demand arrives, while the kernel is responsible for physical placement, migration, accounting, and observability.
 
+The target model is HBF-like warm capacity exposed through CXL Type-3, DAX, or memory hotplug, with the first serious patch living closer to `Documentation/mm/` and `mm/` than a standalone driver subtree.
+
 ## Why HBF Should Not Be Modeled Only as Block Storage
 
 Treating HBF as a fake SSD or ordinary block device forces the runtime onto a demand-driven I/O path:
@@ -98,14 +100,6 @@ Use case:
 
 - older context blocks with lower near-term reuse probability
 
-### `HBF_HINT_PIN`
-
-Request temporary placement stability for data that should not be displaced while an operation is in flight.
-
-Use case:
-
-- short critical regions during accelerator submission
-
 ### `HBF_HINT_RELEASE`
 
 Release previously expressed urgency or pinning so the kernel can resume normal placement and reclaim policy.
@@ -133,12 +127,14 @@ Each option reflects a different center of gravity:
 - MM if the abstraction becomes page-placement policy first
 - heterogeneous memory frameworks if accelerators become first-class consumers
 
+For the current patch, `PIN` is intentionally omitted from the active v1 operation set. If it returns later, it should likely be privileged and justified separately.
+
 ## Suggested Control-Plane Shape
 
 For an RFC, a thin control plane is enough:
 
 - a small UAPI struct describing address, length, operation, flags, deadline, and a user tag
-- a char device or similarly isolated control endpoint
+- a char device or similarly isolated control endpoint only as an RFC frontend
 - backend-specific translation into migration, prefetch, or staging work
 
 That keeps the experiment focused on kernel abstraction rather than pretending the hardware contract is already settled.

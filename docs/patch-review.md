@@ -4,112 +4,77 @@ This document reviews the current prototype patch in [rfc-hbf-linux-control-plan
 
 ## Patch Summary
 
-The current patch is a single RFC-style mail patch that contains a cover letter plus implementation hunks. It adds or modifies the following paths:
+The current patch is a single git-formatted prototype patch that adds or modifies:
 
-- `MAINTAINERS`
-- `drivers/memory/Kconfig`
-- `drivers/memory/Makefile`
-- `drivers/memory/hbf/Kconfig`
-- `drivers/memory/hbf/Kconfig.debug`
-- `drivers/memory/hbf/Makefile`
-- `drivers/memory/hbf/core.c`
-- `drivers/memory/hbf/trace.h`
-- `drivers/memory/hbf/trace.c`
+- `Documentation/mm/hbf-control-plane.rst`
 - `include/uapi/linux/hbf.h`
-- `include/linux/hbf.h`
-- `tools/testing/selftests/hbf/Makefile`
-- `tools/testing/selftests/hbf/hbf_hint_test.c`
+- `mm/Kconfig`
+- `mm/Makefile`
+- `mm/hbf.c`
+- `samples/hbf/hbfctl-demo.c`
+- `tools/testing/selftests/mm/hbf_hint_abi.c`
 
 What it tries to introduce:
 
-- a new HBF control-plane location under `drivers/memory/hbf/`
-- a new UAPI header with hint operations and AI-oriented object classes
-- a miscdevice `/dev/hbfctl`
-- a new sysfs class under `/sys/class/hbf/`
-- a kernel registration API for future hardware drivers
-- tracepoints for hint submission and completion
-- a selftest for basic hint submission
+- an `mm`-oriented memory-tier hint proposal
+- a narrow UAPI for range hints
+- a small `mm/hbf.c` skeleton
+- a temporary `/dev/hbfctl` frontend for RFC experimentation
+- sample and selftest material
 
 ## What Is Reasonable
 
-- The patch is correctly trying to keep the initial abstraction thin and advisory.
-- It is reasonable to treat proactive placement and staging as the core problem, not block I/O alone.
-- It is reasonable to look near CXL, DAX, memory tiering, migration, and NUMA policy rather than inventing a fake SSD-centric model.
-- It is reasonable to start with a prototype interface before debating the final subsystem home.
-- The patch is honest in some places about avoiding vendor-specific hardware details.
+- Moving the idea closer to `mm/` and `Documentation/mm/` is much more credible than a standalone driver-first subsystem.
+- The patch now treats HBF-like capacity as a warm memory tier rather than a block device.
+- The operation set is narrower and more disciplined.
+- Omitting `PIN` from the first patch is a good simplification.
+- The TODO markers name the right future integration points without pretending the hard work is already done.
 
-## What LKML Reviewers May Object To
+## What LKML Reviewers May Still Object To
 
-- The cover letter says HBF "is being standardized" and describes it as a NAND-based tier. That is too concrete for a repo that otherwise has no public hardware programming model to cite.
-- The patch introduces a new subsystem shape too early: new class, new UAPI, new registration API, new tracepoints, and selftests before the problem statement is agreed.
-- The UAPI encodes AI-specific object classes such as KV cache, model weight, embedding, and context directly into kernel ABI.
-- The patch creates a `drivers/memory/hbf/` home before showing why the feature is not just a CXL, DAX, MM, or policy-layer extension.
-- The current dispatch policy broadcasts to the first registered device or prefers `target_node`, which will look arbitrary and under-designed.
-- The patch presents sysfs-exposed capacity and bandwidth metadata without a clear user, accounting model, or evidence that a standalone device class is appropriate.
-- The selftest is not enough to justify the ABI. It only checks that an ioctl path exists and returns something plausible.
+- The patch still creates a new ioctl UAPI before proving that `madvise()` or existing MM policy surfaces are inadequate.
+- `/dev/hbfctl` may still look like an unnecessary temporary interface.
+- The patch validates ranges but still does not execute meaningful MM work.
+- The patch may be seen as too speculative without a stronger CXL or DAX-backed proxy story.
+- The sample and selftest may look premature without stronger semantics.
 
 ## ABI Concerns
 
-- `include/uapi/linux/hbf.h` is the biggest review risk in the series.
-- `enum hbf_object_class` hard-codes workload semantics into the ABI too early.
-- `HBF_HINT_PIN_WARM` mixes a policy outcome with a hint name and may not generalize.
-- `deadline_ns` and `expected_reuse_ns` look attractive, but they are easy to add and hard to support meaningfully across backends.
-- `target_node` leaks kernel placement language into a proposed user ABI before the subsystem home is settled.
-- The reserved field count and versioning are good instincts, but the shape is still premature.
-
-Likely reviewer reaction:
-
-- do not add a UAPI until there is a narrower problem statement
-- if a UAPI is needed, make it more generic and less AI-labeled
-- consider `madvise()` or policy reuse before adding a new ioctl family
+- `include/uapi/linux/hbf.h` is still the highest-risk part of the patch.
+- `target_nid` may be too close to internal placement policy for an early UAPI.
+- `deadline_ns` and `user_tag` are plausible, but reviewers may still ask why they belong in v1.
+- Even a small ioctl ABI is still an ABI that may be hard to retract.
 
 ## Subsystem Placement Concerns
 
-- `drivers/memory/hbf/` may be the wrong home if the long-term mechanism is really MM policy plus migration.
-- The patch does not justify why this should not live under `drivers/cxl/` or `drivers/dax/` as a backend-adjacent experiment.
-- If the abstraction is really about process memory ranges, reviewers may expect an MM-first discussion instead of a new device class.
-- If the abstraction is really about device-backed ranges, reviewers may ask why this is not a DAX or CXL policy interface.
+- `mm/hbf.c` is a better temporary home than `drivers/memory/hbf/`, but the final home is still unresolved.
+- Reviewers may ask whether a standalone `mm/hbf.c` file should exist at all, or whether the idea should be folded directly into `madvise()`, mempolicy, or tiering work.
+- If the first real backend is CXL-backed DAX or hotplugged memory, CXL and DAX maintainers will still want to shape the abstraction.
 
 ## Security/Accounting Concerns
 
-- The prototype validates struct shape but does not validate that the process is authorized to hint the target range in any meaningful MM sense.
-- There is no cgroup accounting, memcg integration, admission control, or rate limiting.
-- There is no story for multi-tenant fairness or abuse prevention.
-- A hint path that can drive DMA, migration, or backend staging needs a clearer security boundary than "who can open `/dev/hbfctl`."
-- The `0600` miscdevice mode is a starting point, but it is not a full policy story.
+- Range validation is improved, but the policy story is still incomplete.
+- There is still no memcg accounting, cgroup budget, or admission control model.
+- A process-local hint path is easier to reason about than a driver registration layer, but it still needs a longer-term isolation story.
 
 ## Hardware-Abstraction Concerns
 
-- The patch is still too specific in describing future hardware as "NAND-based" and "being standardized" without a cited public programming model.
-- The registration API assumes a future hardware-driver ecosystem without first proving that a standalone registration layer is necessary.
-- The sysfs attributes imply stable device identity and stable performance metadata even though the backend model is not known.
-- There is no explanation of how accelerator-local memory, CXL Type-3 memory, DAX mappings, or migration-based implementations would converge behind this API.
+- The patch is better because it no longer claims a driver-first subsystem or a block model.
+- It still needs to stay disciplined about not inventing hardware facts or implying that public HBF specs already exist.
+- The real test is whether the abstraction still makes sense when mapped onto CXL Type-3, DAX, and memory-tier mechanisms rather than a named future device category.
 
 ## Missing Pieces
 
-- No `Documentation/` patch describing the problem in kernel terms.
-- No integration with `tools/testing/selftests/Makefile`, so the new selftest directory is not obviously wired up.
-- No MM validation path for the virtual address ranges.
-- No explicit admission/rejection tracepoints separate from generic completion status.
-- No discussion of interaction with memory tiers, NUMA balancing, or migration internals.
-- No story for how a backend would consume the hint safely.
-- No evidence that this needs to be a device class rather than a narrower temporary prototype hook.
+- no real migration, prefetch, or demotion implementation
+- no tracepoints yet
+- no mempolicy or memory-tier integration
+- no evidence that ioctl is preferable to `madvise()`
+- no stronger benchmark or proxy execution story inside the patch itself
 
-## Naming/API Problems
+## Recommended v1 Follow-Up
 
-- `hbf` itself may draw review pressure if the hardware term is not publicly grounded.
-- `HBF_HINT_PIN_WARM` is policy-heavy and ambiguous.
-- `hbf_hint_submit` and `hbf_hint_complete` are too coarse for diagnosing why hints were accepted, rejected, ignored, or only partially acted on.
-- `struct hbf_user_hint` mixes object semantics, deadline semantics, locality hints, and placement hints into one early ABI.
-- `desc->name` is accepted by registration but the actual device name exported is always `hbf%d`, which weakens the purpose of the provided name.
-
-## Recommended v1 Changes
-
-- Move to a documentation-first RFC series before trying to land code structure.
-- Narrow the first code-bearing RFC to a tiny experimental UAPI and miscdevice skeleton, or even documentation only if review indicates that a UAPI is premature.
-- Strip out AI-specific object classes from the first ABI draft, or mark them as intentionally provisional in documentation rather than in code.
-- Replace any wording that implies public standardization or settled hardware properties.
-- Add explicit documentation that hints are advisory, may be ignored, and must never be correctness-critical.
-- Reframe the problem as runtime-guided memory placement for future high-capacity warm tiers, not as a named hardware subsystem seeking a permanent home.
-- Add better observability proposals before adding policy claims.
-- Treat CXL, DAX, MM, and mempolicy reviewers as primary stakeholders from the first RFC.
+- keep the memory-tier framing
+- keep the patch near `Documentation/mm/` and `mm/`
+- continue treating `/dev/hbfctl` as RFC-only
+- resist re-expanding into a generic driver or device-class story
+- build stronger proxy experiments around CXL, DAX, and hotplug-backed tiers

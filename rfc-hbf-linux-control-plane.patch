@@ -1,151 +1,90 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Manish KL <manish@example.com>
-Date: Fri, 1 May 2026 00:00:00 +0530
-Subject: [RFC PATCH 0/4] memory: hbf: introduce High Bandwidth Flash tier
- control plane
-
-High Bandwidth Flash (HBF) is being standardized as a high-capacity,
-high-bandwidth NAND-based tier for AI inference systems.  The expected
-software problem is not merely exposing another block device: inference
-runtimes need to stage token/KV/context data before compute demand, and
-memory-management code needs enough semantic signal to avoid treating HBF
-as a blind SSD spill tier.
-
-This RFC introduces a small HBF control plane:
-
-  1. a device class under /sys/class/hbf/
-  2. a uapi ioctl for runtime-provided placement/prefetch hints
-  3. an in-kernel registration API for future CXL/HBF or vendor drivers
-  4. tracepoints for hint admission and completion
-
-This first RFC deliberately avoids hard-coding vendor IDs, CXL DVSEC
-layout, flash geometry, or DMA engines.  Those belong in the eventual
-device-specific driver once an HBF specification is public.  The goal here
-is to define the OS-facing contract: HBF is a warm, byte-addressable or
-DMA-addressable AI memory tier, and runtimes should be able to tell the
-kernel what objects are hot, cold, prefetchable, or demotable.
-
-The intended future path is:
-
-    AI runtime -> /dev/hbfctl hint -> HBF policy engine
-        -> CXL/HBF driver -> DMA/prefetch/promotion/demotion
-        -> HBM/DRAM/HBF placement
-
-Patch layout:
-
-  [1/4] uapi: add linux/hbf.h placement hint ABI
-  [2/4] memory: hbf: add core class, registration API, and misc control dev
-  [3/4] memory: hbf: add tracepoints for runtime hints
-  [4/4] MAINTAINERS: add HBF entry
-
-This is not a final hardware enablement patch. It is an LKML-style RFC
-for discussion on whether HBF should be represented as a memory-tier
-policy surface layered on top of CXL/DAX/mm migration rather than as a
-new block-only device model.
+From 1eeb1a0dbc39b66030fa797f323689e3b37ca880 Mon Sep 17 00:00:00 2001
+From: Codex Local <codex@example.com>
+Date: Sat, 2 May 2026 00:36:19 -0700
+Subject: [PATCH] mm: add experimental HBF-like hint control skeleton
 
 ---
+ Documentation/mm/hbf-control-plane.rst    |  54 ++++++++++
+ include/uapi/linux/hbf.h                  |  34 ++++++
+ mm/Kconfig                                |  11 +-
+ mm/Makefile                               |   3 +-
+ mm/hbf.c                                  | 124 ++++++++++++++++++++++
+ samples/hbf/hbfctl-demo.c                 | 102 ++++++++++++++++++
+ tools/testing/selftests/mm/hbf_hint_abi.c |  45 ++++++++
+ 7 files changed, 371 insertions(+), 2 deletions(-)
+ create mode 100644 Documentation/mm/hbf-control-plane.rst
+ create mode 100644 include/uapi/linux/hbf.h
+ create mode 100644 mm/hbf.c
+ create mode 100644 samples/hbf/hbfctl-demo.c
+ create mode 100644 tools/testing/selftests/mm/hbf_hint_abi.c
 
-diff --git a/MAINTAINERS b/MAINTAINERS
-index 000000000000..111111111111 100644
---- a/MAINTAINERS
-+++ b/MAINTAINERS
-@@ -0,0 +1,9 @@
-+HIGH BANDWIDTH FLASH (HBF) MEMORY CONTROL PLANE
-+M:	Manish KL <manish@example.com>
-+L:	linux-mm@kvack.org
-+L:	linux-cxl@vger.kernel.org
-+L:	linux-kernel@vger.kernel.org
-+S:	Supported
-+F:	drivers/memory/hbf/
-+F:	include/linux/hbf.h
-+F:	include/uapi/linux/hbf.h
-
-diff --git a/drivers/memory/Kconfig b/drivers/memory/Kconfig
-index 000000000000..222222222222 100644
---- a/drivers/memory/Kconfig
-+++ b/drivers/memory/Kconfig
-@@ -0,0 +1,2 @@
-+
-+source "drivers/memory/hbf/Kconfig"
-
-diff --git a/drivers/memory/Makefile b/drivers/memory/Makefile
-index 000000000000..333333333333 100644
---- a/drivers/memory/Makefile
-+++ b/drivers/memory/Makefile
-@@ -0,0 +1 @@
-+obj-$(CONFIG_HBF)		+= hbf/
-
-diff --git a/drivers/memory/hbf/Kconfig b/drivers/memory/hbf/Kconfig
+diff --git a/Documentation/mm/hbf-control-plane.rst b/Documentation/mm/hbf-control-plane.rst
 new file mode 100644
-index 000000000000..444444444444
+index 0000000..9f849e6
 --- /dev/null
-+++ b/drivers/memory/hbf/Kconfig
-@@ -0,0 +1,28 @@
-+# SPDX-License-Identifier: GPL-2.0
++++ b/Documentation/mm/hbf-control-plane.rst
+@@ -0,0 +1,54 @@
++HBF-Like Memory Tier Control Plane
++==================================
 +
-+menuconfig HBF
-+	tristate "High Bandwidth Flash (HBF) control plane"
-+	depends on MMU
-+	select SRCU
-+	help
-+	  Enable a generic kernel control plane for High Bandwidth Flash
-+	  devices and tiers.
++This document describes an experimental RFC control plane for HBF-like warm
++memory tiers exposed through CXL Type-3 memory, DAX mappings, or memory
++hotplugged capacity.
 +
-+	  HBF is expected to be a high-capacity, high-bandwidth NAND-based
-+	  memory tier used by AI inference and other memory-capacity-bound
-+	  workloads.  This option does not bind to a concrete HBF device.
-+	  Instead, it provides:
++The target model is not a standalone block device subsystem. The target model is
++an mm-facing hint path for byte-addressable or migration-managed warm capacity
++that sits below HBM and above cold storage.
 +
-+	    /dev/hbfctl
-+	    /sys/class/hbf/
-+	    an in-kernel registration API
-+	    a userspace hint ABI for placement and prefetch
++Goals
++-----
 +
-+	  Future CXL, PCIe, or platform HBF drivers can register devices with
-+	  this core and consume runtime hints.
++- Treat HBF-like capacity as a warm memory tier.
++- Keep the first RFC close to ``Documentation/mm/`` and ``mm/``.
++- Allow an RFC frontend such as ``/dev/hbfctl`` only as a temporary ingestion
++  surface, not as the long-term ABI commitment.
++- Keep hints advisory and non-correctness-critical.
 +
-+	  If unsure, say N.
++Non-goals
++---------
 +
-+if HBF
++- No block-layer model is required for the first serious RFC.
++- No real migration or CXL backend is implemented here.
++- No tracepoints are added in this skeleton; observability is left to a later
++  RFC once the control-plane shape survives review.
 +
-+source "drivers/memory/hbf/Kconfig.debug"
++Design sketch
++-------------
 +
-+endif
++The proposed interface describes a virtual address range and a small operation
++set:
 +
-diff --git a/drivers/memory/hbf/Kconfig.debug b/drivers/memory/hbf/Kconfig.debug
-new file mode 100644
-index 000000000000..555555555555
---- /dev/null
-+++ b/drivers/memory/hbf/Kconfig.debug
-@@ -0,0 +1,10 @@
-+# SPDX-License-Identifier: GPL-2.0
++- ``HBF_HINT_PREFETCH``
++- ``HBF_HINT_PROMOTE``
++- ``HBF_HINT_DEMOTE``
++- ``HBF_HINT_RELEASE``
 +
-+config HBF_DEBUG
-+	bool "HBF debug logging"
-+	depends on HBF
-+	help
-+	  Enable additional debug logging in the HBF control plane.
++``HBF_HINT_PIN`` is intentionally omitted from v1. If a pinning concept is ever
++needed, it should likely be privileged and justified separately.
 +
-+	  This is intended only for development of HBF policy and hardware
-+	  drivers.
-
-diff --git a/drivers/memory/hbf/Makefile b/drivers/memory/hbf/Makefile
-new file mode 100644
-index 000000000000..666666666666
---- /dev/null
-+++ b/drivers/memory/hbf/Makefile
-@@ -0,0 +1,4 @@
-+# SPDX-License-Identifier: GPL-2.0
++The kernel-side helper validates the range and currently returns
++``-EOPNOTSUPP`` after basic checks. Future work may connect this to:
 +
-+obj-$(CONFIG_HBF) += hbf.o
-+hbf-y := core.o trace.o
-
++- ``mm/migrate.c``
++- ``mm/memory-tiers.c``
++- ``mm/mempolicy.c``
++- ``drivers/cxl/core/``
++- ``drivers/cxl/mem.c``
++- ``drivers/cxl/region.c``
++- ``drivers/dax/kmem.c``
++
++This RFC skeleton exists only to make the memory-tier hint shape concrete.
+\ No newline at end of file
 diff --git a/include/uapi/linux/hbf.h b/include/uapi/linux/hbf.h
 new file mode 100644
-index 000000000000..777777777777
+index 0000000..e0319e3
 --- /dev/null
 +++ b/include/uapi/linux/hbf.h
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,34 @@
 +/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 +#ifndef _UAPI_LINUX_HBF_H
 +#define _UAPI_LINUX_HBF_H
@@ -153,383 +92,168 @@ index 000000000000..777777777777
 +#include <linux/ioctl.h>
 +#include <linux/types.h>
 +
++#define HBF_UAPI_VERSION	1
 +#define HBF_IOCTL_MAGIC		'H'
 +
-+/*
-+ * HBF object classes describe what the runtime is hinting about.  The kernel
-+ * must treat these as advisory.  They are not security labels and do not imply
-+ * ownership of the virtual address range.
-+ */
-+enum hbf_object_class {
-+	HBF_OBJECT_UNKNOWN	= 0,
-+	HBF_OBJECT_KV_CACHE	= 1,
-+	HBF_OBJECT_MODEL_WEIGHT	= 2,
-+	HBF_OBJECT_EMBEDDING	= 3,
-+	HBF_OBJECT_CONTEXT	= 4,
-+	HBF_OBJECT_SCRATCH	= 5,
-+};
-+
 +enum hbf_hint_op {
-+	HBF_HINT_PREFETCH	= 1, /* stage before demand */
-+	HBF_HINT_PROMOTE	= 2, /* prefer faster tier */
-+	HBF_HINT_DEMOTE		= 3, /* prefer HBF/warm tier */
-+	HBF_HINT_PIN_WARM	= 4, /* keep in HBF if possible */
-+	HBF_HINT_RELEASE	= 5, /* object no longer useful */
++	HBF_HINT_PREFETCH	= 1,
++	HBF_HINT_PROMOTE	= 2,
++	HBF_HINT_DEMOTE		= 3,
++	HBF_HINT_RELEASE	= 4,
++	/* HBF_HINT_PIN intentionally omitted from v1. */
 +};
 +
-+#define HBF_HINT_F_NOWAIT		(1ULL << 0)
-+#define HBF_HINT_F_ASYNC		(1ULL << 1)
-+#define HBF_HINT_F_WRITE_INTENT		(1ULL << 2)
-+#define HBF_HINT_F_READ_MOSTLY		(1ULL << 3)
-+
-+/*
-+ * Runtime placement hint.
-+ *
-+ * va/len identify the userspace virtual range.  object_id is runtime-defined
-+ * and is surfaced in tracepoints so runtimes can correlate kernel behavior with
-+ * token/KV/context objects.
-+ *
-+ * deadline_ns is relative CLOCK_MONOTONIC time in nanoseconds.  A value of 0
-+ * means there is no explicit deadline.
-+ *
-+ * target_node is optional.  -1 means "kernel chooses".
-+ */
-+struct hbf_user_hint {
++struct hbf_hint_range {
 +	__u32 version;
 +	__u32 op;
 +	__u64 flags;
-+
-+	__u64 va;
++	__u64 start;
 +	__u64 len;
-+	__u64 object_id;
-+
-+	__u32 object_class;
-+	__s32 target_node;
-+
++	__s32 target_nid;
++	__u32 reserved0;
 +	__u64 deadline_ns;
-+	__u64 expected_reuse_ns;
-+
-+	__u64 reserved[8];
++	__u64 user_tag;
++	__u64 reserved[6];
 +};
 +
-+#define HBF_UAPI_VERSION	1
-+
-+#define HBF_IOC_SUBMIT_HINT	_IOW(HBF_IOCTL_MAGIC, 0x01, struct hbf_user_hint)
++#define HBF_IOC_HINT	_IOW(HBF_IOCTL_MAGIC, 0x01, struct hbf_hint_range)
 +
 +#endif /* _UAPI_LINUX_HBF_H */
-
-diff --git a/include/linux/hbf.h b/include/linux/hbf.h
+\ No newline at end of file
+diff --git a/mm/Kconfig b/mm/Kconfig
+index e27a5bb..329f7d3 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1,3 +1,12 @@
+-menu "Memory Management options"
++config HBF_CONTROL_PLANE
++	tristate "Experimental HBF-like memory tier hint control plane"
++	depends on MMU
++	help
++	  Enable an experimental mm-facing control plane for HBF-like warm
++	  capacity exposed through CXL Type-3, DAX, or memory hotplug.
++
++	  This is an RFC skeleton only. It validates hint ranges and provides an
++	  optional RFC frontend, but it does not implement real migration or
++	  backend execution.
+ 
+ source "mm/damon/Kconfig"
+\ No newline at end of file
+diff --git a/mm/Makefile b/mm/Makefile
+index d05c6fc..0a61003 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -1 +1,2 @@
+-obj-y			+= filemap.o mempool.o oom_kill.o
+\ No newline at end of file
++obj-y			+= filemap.o mempool.o oom_kill.o
++obj-$(CONFIG_HBF_CONTROL_PLANE)	+= hbf.o
+\ No newline at end of file
+diff --git a/mm/hbf.c b/mm/hbf.c
 new file mode 100644
-index 000000000000..888888888888
+index 0000000..e05d2bd
 --- /dev/null
-+++ b/include/linux/hbf.h
-@@ -0,0 +1,77 @@
-+/* SPDX-License-Identifier: GPL-2.0 */
-+#ifndef _LINUX_HBF_H
-+#define _LINUX_HBF_H
-+
-+#include <linux/device.h>
-+#include <linux/list.h>
-+#include <linux/mutex.h>
-+#include <linux/types.h>
-+#include <uapi/linux/hbf.h>
-+
-+struct hbf_device;
-+
-+/**
-+ * struct hbf_dev_ops - operations supplied by an HBF hardware driver
-+ * @submit_hint: consume a runtime hint; may schedule DMA/prefetch/migration
-+ *
-+ * The callback is advisory and may return:
-+ *   0          hint accepted
-+ *   -EOPNOTSUPP unsupported hint
-+ *   -EBUSY     no capacity/queue space
-+ *   <0         other failure
-+ */
-+struct hbf_dev_ops {
-+	int (*submit_hint)(struct hbf_device *hdev,
-+			   const struct hbf_user_hint *hint);
-+};
-+
-+/**
-+ * struct hbf_dev_desc - HBF device registration descriptor
-+ * @parent: physical parent device
-+ * @name: user-visible device name
-+ * @nid: NUMA node if known, otherwise NUMA_NO_NODE
-+ * @capacity_bytes: usable HBF capacity
-+ * @read_bw_bytes_per_sec: approximate read bandwidth
-+ * @write_bw_bytes_per_sec: approximate write bandwidth
-+ * @read_latency_ns: approximate media/controller read latency
-+ * @ops: device operations
-+ * @driver_data: opaque driver data
-+ */
-+struct hbf_dev_desc {
-+	struct device *parent;
-+	const char *name;
-+	int nid;
-+	u64 capacity_bytes;
-+	u64 read_bw_bytes_per_sec;
-+	u64 write_bw_bytes_per_sec;
-+	u64 read_latency_ns;
-+	const struct hbf_dev_ops *ops;
-+	void *driver_data;
-+};
-+
-+struct hbf_device {
-+	struct device dev;
-+	struct list_head node;
-+	struct mutex lock;
-+
-+	int id;
-+	int nid;
-+	u64 capacity_bytes;
-+	u64 read_bw_bytes_per_sec;
-+	u64 write_bw_bytes_per_sec;
-+	u64 read_latency_ns;
-+
-+	const struct hbf_dev_ops *ops;
-+	void *driver_data;
-+};
-+
-+#define to_hbf_device(_dev) container_of(_dev, struct hbf_device, dev)
-+
-+#if IS_ENABLED(CONFIG_HBF)
-+struct hbf_device *hbf_register_device(const struct hbf_dev_desc *desc);
-+void hbf_unregister_device(struct hbf_device *hdev);
-+#else
-+static inline struct hbf_device *hbf_register_device(const struct hbf_dev_desc *desc)
-+{
-+	return ERR_PTR(-EOPNOTSUPP);
-+}
-+static inline void hbf_unregister_device(struct hbf_device *hdev) {}
-+#endif
-+
-+#endif /* _LINUX_HBF_H */
-
-diff --git a/drivers/memory/hbf/core.c b/drivers/memory/hbf/core.c
-new file mode 100644
-index 000000000000..999999999999
---- /dev/null
-+++ b/drivers/memory/hbf/core.c
-@@ -0,0 +1,328 @@
++++ b/mm/hbf.c
+@@ -0,0 +1,124 @@
 +// SPDX-License-Identifier: GPL-2.0
-+/*
-+ * High Bandwidth Flash (HBF) control plane
-+ *
-+ * This core intentionally avoids binding to a concrete HBF transport.  HBF
-+ * hardware may appear as CXL-attached memory, a PCIe device, an accelerator-
-+ * local tier, or another platform-specific device.  The role of this file is
-+ * to provide a common registration and userspace hint surface.
-+ */
-+
-+#include <linux/anon_inodes.h>
-+#include <linux/atomic.h>
-+#include <linux/cdev.h>
-+#include <linux/class.h>
-+#include <linux/err.h>
 +#include <linux/fs.h>
-+#include <linux/hbf.h>
-+#include <linux/idr.h>
 +#include <linux/init.h>
-+#include <linux/list.h>
 +#include <linux/miscdevice.h>
++#include <linux/mm.h>
 +#include <linux/module.h>
 +#include <linux/mutex.h>
++#include <linux/sched/mm.h>
 +#include <linux/slab.h>
 +#include <linux/uaccess.h>
++#include <uapi/linux/hbf.h>
 +
-+#include "trace.h"
-+
-+static DEFINE_IDA(hbf_ida);
-+static DEFINE_MUTEX(hbf_devices_lock);
-+static LIST_HEAD(hbf_devices);
-+
-+static struct class *hbf_class;
-+
-+static ssize_t capacity_bytes_show(struct device *dev,
-+				   struct device_attribute *attr, char *buf)
++static int hbf_validate_vma_range(struct mm_struct *mm,
++				 unsigned long start,
++				 unsigned long len)
 +{
-+	struct hbf_device *hdev = to_hbf_device(dev);
++	struct vm_area_struct *vma;
++	unsigned long end;
 +
-+	return sysfs_emit(buf, "%llu\n", hdev->capacity_bytes);
-+}
-+static DEVICE_ATTR_RO(capacity_bytes);
++	if (!mm || !len)
++		return -EINVAL;
 +
-+static ssize_t numa_node_show(struct device *dev,
-+			      struct device_attribute *attr, char *buf)
-+{
-+	struct hbf_device *hdev = to_hbf_device(dev);
++	end = start + len;
++	if (end < start)
++		return -EINVAL;
 +
-+	return sysfs_emit(buf, "%d\n", hdev->nid);
-+}
-+static DEVICE_ATTR_RO(numa_node);
++	mmap_read_lock(mm);
++	vma = find_vma(mm, start);
++	if (!vma || start < vma->vm_start || end > vma->vm_end) {
++		mmap_read_unlock(mm);
++		return -EFAULT;
++	}
++	mmap_read_unlock(mm);
 +
-+static ssize_t read_bandwidth_bytes_per_sec_show(struct device *dev,
-+						 struct device_attribute *attr,
-+						 char *buf)
-+{
-+	struct hbf_device *hdev = to_hbf_device(dev);
-+
-+	return sysfs_emit(buf, "%llu\n", hdev->read_bw_bytes_per_sec);
-+}
-+static DEVICE_ATTR_RO(read_bandwidth_bytes_per_sec);
-+
-+static ssize_t write_bandwidth_bytes_per_sec_show(struct device *dev,
-+						  struct device_attribute *attr,
-+						  char *buf)
-+{
-+	struct hbf_device *hdev = to_hbf_device(dev);
-+
-+	return sysfs_emit(buf, "%llu\n", hdev->write_bw_bytes_per_sec);
-+}
-+static DEVICE_ATTR_RO(write_bandwidth_bytes_per_sec);
-+
-+static ssize_t read_latency_ns_show(struct device *dev,
-+				    struct device_attribute *attr, char *buf)
-+{
-+	struct hbf_device *hdev = to_hbf_device(dev);
-+
-+	return sysfs_emit(buf, "%llu\n", hdev->read_latency_ns);
-+}
-+static DEVICE_ATTR_RO(read_latency_ns);
-+
-+static struct attribute *hbf_dev_attrs[] = {
-+	&dev_attr_capacity_bytes.attr,
-+	&dev_attr_numa_node.attr,
-+	&dev_attr_read_bandwidth_bytes_per_sec.attr,
-+	&dev_attr_write_bandwidth_bytes_per_sec.attr,
-+	&dev_attr_read_latency_ns.attr,
-+	NULL,
-+};
-+ATTRIBUTE_GROUPS(hbf_dev);
-+
-+static void hbf_device_release(struct device *dev)
-+{
-+	struct hbf_device *hdev = to_hbf_device(dev);
-+
-+	kfree(hdev);
++	return 0;
 +}
 +
-+static bool hbf_valid_hint(const struct hbf_user_hint *hint)
++int hbf_hint_range(struct mm_struct *mm, unsigned long start,
++		   unsigned long len,
++		   const struct hbf_hint_range *hint)
 +{
-+	if (hint->version != HBF_UAPI_VERSION)
-+		return false;
++	int ret;
 +
-+	if (!hint->len)
-+		return false;
++	if (!hint)
++		return -EINVAL;
 +
-+	if (hint->va + hint->len < hint->va)
-+		return false;
++	ret = hbf_validate_vma_range(mm, start, len);
++	if (ret)
++		return ret;
 +
 +	switch (hint->op) {
 +	case HBF_HINT_PREFETCH:
 +	case HBF_HINT_PROMOTE:
 +	case HBF_HINT_DEMOTE:
-+	case HBF_HINT_PIN_WARM:
 +	case HBF_HINT_RELEASE:
 +		break;
 +	default:
-+		return false;
++		return -EINVAL;
 +	}
 +
-+	switch (hint->object_class) {
-+	case HBF_OBJECT_UNKNOWN:
-+	case HBF_OBJECT_KV_CACHE:
-+	case HBF_OBJECT_MODEL_WEIGHT:
-+	case HBF_OBJECT_EMBEDDING:
-+	case HBF_OBJECT_CONTEXT:
-+	case HBF_OBJECT_SCRATCH:
-+		break;
-+	default:
-+		return false;
-+	}
-+
-+	return true;
++	/*
++	 * TODO: Connect prefetch / promote / demote decisions to core mm
++	 * machinery rather than implementing driver-first policy here.
++	 *
++	 * Candidate integration points:
++	 *   - mm/migrate.c
++	 *   - mm/memory-tiers.c
++	 *   - mm/mempolicy.c
++	 *   - drivers/cxl/core/
++	 *   - drivers/cxl/mem.c
++	 *   - drivers/cxl/region.c
++	 *   - drivers/dax/kmem.c
++	 */
++	return -EOPNOTSUPP;
 +}
++EXPORT_SYMBOL_GPL(hbf_hint_range);
 +
-+static int hbf_submit_hint_to_device(struct hbf_device *hdev,
-+				     const struct hbf_user_hint *hint)
++static long hbf_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 +{
-+	int ret = -EOPNOTSUPP;
++	struct hbf_hint_range hint;
 +
-+	mutex_lock(&hdev->lock);
-+	if (hdev->ops && hdev->ops->submit_hint)
-+		ret = hdev->ops->submit_hint(hdev, hint);
-+	mutex_unlock(&hdev->lock);
-+
-+	return ret;
-+}
-+
-+/*
-+ * First policy is deliberately simple:
-+ *   - if userspace provides target_node, prefer matching HBF devices
-+ *   - otherwise broadcast to the first registered device
-+ *
-+ * A future policy engine should consider memory tiers, DAMON hotness,
-+ * NUMA locality, CXL region bandwidth, queue depth, and accelerator affinity.
-+ */
-+static int hbf_dispatch_hint(const struct hbf_user_hint *hint)
-+{
-+	struct hbf_device *hdev, *fallback = NULL;
-+	int ret = -ENODEV;
-+
-+	mutex_lock(&hbf_devices_lock);
-+	list_for_each_entry(hdev, &hbf_devices, node) {
-+		if (!fallback)
-+			fallback = hdev;
-+
-+		if (hint->target_node >= 0 && hdev->nid == hint->target_node) {
-+			get_device(&hdev->dev);
-+			mutex_unlock(&hbf_devices_lock);
-+			ret = hbf_submit_hint_to_device(hdev, hint);
-+			put_device(&hdev->dev);
-+			return ret;
-+		}
-+	}
-+
-+	if (fallback)
-+		get_device(&fallback->dev);
-+	mutex_unlock(&hbf_devices_lock);
-+
-+	if (fallback) {
-+		ret = hbf_submit_hint_to_device(fallback, hint);
-+		put_device(&fallback->dev);
-+	}
-+
-+	return ret;
-+}
-+
-+static long hbf_ctl_ioctl(struct file *file, unsigned int cmd,
-+			  unsigned long arg)
-+{
-+	struct hbf_user_hint hint;
-+	int ret;
-+
-+	switch (cmd) {
-+	case HBF_IOC_SUBMIT_HINT:
-+		if (copy_from_user(&hint, (void __user *)arg, sizeof(hint)))
-+			return -EFAULT;
-+
-+		if (!hbf_valid_hint(&hint))
-+			return -EINVAL;
-+
-+		trace_hbf_hint_submit(hint.object_id, hint.op,
-+				      hint.object_class, hint.va, hint.len,
-+				      hint.target_node, hint.flags);
-+
-+		ret = hbf_dispatch_hint(&hint);
-+
-+		trace_hbf_hint_complete(hint.object_id, hint.op, ret);
-+
-+		return ret;
-+	default:
++	if (cmd != HBF_IOC_HINT)
 +		return -ENOTTY;
-+	}
++
++	if (copy_from_user(&hint, (void __user *)arg, sizeof(hint)))
++		return -EFAULT;
++
++	if (hint.version != HBF_UAPI_VERSION)
++		return -EINVAL;
++
++	if (!current->mm)
++		return -EOPNOTSUPP;
++
++	return hbf_hint_range(current->mm, hint.start, hint.len, &hint);
 +}
 +
-+static const struct file_operations hbf_ctl_fops = {
++static const struct file_operations hbf_fops = {
 +	.owner		= THIS_MODULE,
-+	.unlocked_ioctl	= hbf_ctl_ioctl,
++	.unlocked_ioctl	= hbf_ioctl,
 +	.compat_ioctl	= compat_ptr_ioctl,
 +	.llseek		= no_llseek,
 +};
@@ -537,280 +261,186 @@ index 000000000000..999999999999
 +static struct miscdevice hbf_miscdev = {
 +	.minor = MISC_DYNAMIC_MINOR,
 +	.name = "hbfctl",
-+	.fops = &hbf_ctl_fops,
++	.fops = &hbf_fops,
 +	.mode = 0600,
 +};
 +
-+struct hbf_device *hbf_register_device(const struct hbf_dev_desc *desc)
-+{
-+	struct hbf_device *hdev;
-+	int id, ret;
-+
-+	if (!desc || !desc->name || !desc->parent)
-+		return ERR_PTR(-EINVAL);
-+
-+	id = ida_alloc(&hbf_ida, GFP_KERNEL);
-+	if (id < 0)
-+		return ERR_PTR(id);
-+
-+	hdev = kzalloc(sizeof(*hdev), GFP_KERNEL);
-+	if (!hdev) {
-+		ret = -ENOMEM;
-+		goto err_ida;
-+	}
-+
-+	hdev->id = id;
-+	hdev->nid = desc->nid;
-+	hdev->capacity_bytes = desc->capacity_bytes;
-+	hdev->read_bw_bytes_per_sec = desc->read_bw_bytes_per_sec;
-+	hdev->write_bw_bytes_per_sec = desc->write_bw_bytes_per_sec;
-+	hdev->read_latency_ns = desc->read_latency_ns;
-+	hdev->ops = desc->ops;
-+	hdev->driver_data = desc->driver_data;
-+	mutex_init(&hdev->lock);
-+	INIT_LIST_HEAD(&hdev->node);
-+
-+	device_initialize(&hdev->dev);
-+	hdev->dev.class = hbf_class;
-+	hdev->dev.parent = desc->parent;
-+	hdev->dev.release = hbf_device_release;
-+	dev_set_name(&hdev->dev, "hbf%d", id);
-+
-+	ret = device_add(&hdev->dev);
-+	if (ret)
-+		goto err_put;
-+
-+	mutex_lock(&hbf_devices_lock);
-+	list_add_tail(&hdev->node, &hbf_devices);
-+	mutex_unlock(&hbf_devices_lock);
-+
-+	dev_info(&hdev->dev, "registered HBF device '%s'\n", desc->name);
-+
-+	return hdev;
-+
-+err_put:
-+	put_device(&hdev->dev);
-+err_ida:
-+	ida_free(&hbf_ida, id);
-+	return ERR_PTR(ret);
-+}
-+EXPORT_SYMBOL_GPL(hbf_register_device);
-+
-+void hbf_unregister_device(struct hbf_device *hdev)
-+{
-+	if (!hdev)
-+		return;
-+
-+	mutex_lock(&hbf_devices_lock);
-+	list_del_init(&hdev->node);
-+	mutex_unlock(&hbf_devices_lock);
-+
-+	device_unregister(&hdev->dev);
-+	ida_free(&hbf_ida, hdev->id);
-+}
-+EXPORT_SYMBOL_GPL(hbf_unregister_device);
-+
 +static int __init hbf_init(void)
 +{
-+	int ret;
-+
-+	hbf_class = class_create("hbf");
-+	if (IS_ERR(hbf_class))
-+		return PTR_ERR(hbf_class);
-+
-+	hbf_class->dev_groups = hbf_dev_groups;
-+
-+	ret = misc_register(&hbf_miscdev);
-+	if (ret)
-+		goto err_class;
-+
-+	pr_info("hbf: High Bandwidth Flash control plane initialized\n");
-+	return 0;
-+
-+err_class:
-+	class_destroy(hbf_class);
-+	return ret;
++	return misc_register(&hbf_miscdev);
 +}
 +module_init(hbf_init);
 +
 +static void __exit hbf_exit(void)
 +{
 +	misc_deregister(&hbf_miscdev);
-+	class_destroy(hbf_class);
-+	ida_destroy(&hbf_ida);
 +}
 +module_exit(hbf_exit);
 +
 +MODULE_LICENSE("GPL");
-+MODULE_AUTHOR("Manish KL");
-+MODULE_DESCRIPTION("High Bandwidth Flash control plane");
-
-diff --git a/drivers/memory/hbf/trace.h b/drivers/memory/hbf/trace.h
++MODULE_DESCRIPTION("Experimental HBF-like memory tier hint control plane");
+\ No newline at end of file
+diff --git a/samples/hbf/hbfctl-demo.c b/samples/hbf/hbfctl-demo.c
 new file mode 100644
-index 000000000000..aaaaaaaaaaaa
+index 0000000..8f6f9f1
 --- /dev/null
-+++ b/drivers/memory/hbf/trace.h
-@@ -0,0 +1,78 @@
-+/* SPDX-License-Identifier: GPL-2.0 */
-+#undef TRACE_SYSTEM
-+#define TRACE_SYSTEM hbf
-+
-+#if !defined(_HBF_TRACE_H) || defined(TRACE_HEADER_MULTI_READ)
-+#define _HBF_TRACE_H
-+
-+#include <linux/tracepoint.h>
-+
-+TRACE_EVENT(hbf_hint_submit,
-+	TP_PROTO(u64 object_id, u32 op, u32 object_class, u64 va, u64 len,
-+		 s32 target_node, u64 flags),
-+	TP_ARGS(object_id, op, object_class, va, len, target_node, flags),
-+	TP_STRUCT__entry(
-+		__field(u64, object_id)
-+		__field(u32, op)
-+		__field(u32, object_class)
-+		__field(u64, va)
-+		__field(u64, len)
-+		__field(s32, target_node)
-+		__field(u64, flags)
-+	),
-+	TP_fast_assign(
-+		__entry->object_id = object_id;
-+		__entry->op = op;
-+		__entry->object_class = object_class;
-+		__entry->va = va;
-+		__entry->len = len;
-+		__entry->target_node = target_node;
-+		__entry->flags = flags;
-+	),
-+	TP_printk("object_id=%llu op=%u class=%u va=0x%llx len=%llu target_node=%d flags=0x%llx",
-+		  __entry->object_id, __entry->op, __entry->object_class,
-+		  __entry->va, __entry->len, __entry->target_node,
-+		  __entry->flags)
-+);
-+
-+TRACE_EVENT(hbf_hint_complete,
-+	TP_PROTO(u64 object_id, u32 op, int ret),
-+	TP_ARGS(object_id, op, ret),
-+	TP_STRUCT__entry(
-+		__field(u64, object_id)
-+		__field(u32, op)
-+		__field(int, ret)
-+	),
-+	TP_fast_assign(
-+		__entry->object_id = object_id;
-+		__entry->op = op;
-+		__entry->ret = ret;
-+	),
-+	TP_printk("object_id=%llu op=%u ret=%d",
-+		  __entry->object_id, __entry->op, __entry->ret)
-+);
-+
-+#endif /* _HBF_TRACE_H */
-+
-+#undef TRACE_INCLUDE_PATH
-+#define TRACE_INCLUDE_PATH .
-+#undef TRACE_INCLUDE_FILE
-+#define TRACE_INCLUDE_FILE trace
-+
-+#include <trace/define_trace.h>
-
-diff --git a/drivers/memory/hbf/trace.c b/drivers/memory/hbf/trace.c
-new file mode 100644
-index 000000000000..bbbbbbbbbbbb
---- /dev/null
-+++ b/drivers/memory/hbf/trace.c
-@@ -0,0 +1,5 @@
++++ b/samples/hbf/hbfctl-demo.c
+@@ -0,0 +1,102 @@
 +// SPDX-License-Identifier: GPL-2.0
-+
-+#define CREATE_TRACE_POINTS
-+#include "trace.h"
-+
-diff --git a/tools/testing/selftests/hbf/Makefile b/tools/testing/selftests/hbf/Makefile
-new file mode 100644
-index 000000000000..cccccccccccc
---- /dev/null
-+++ b/tools/testing/selftests/hbf/Makefile
-@@ -0,0 +1,7 @@
-+# SPDX-License-Identifier: GPL-2.0
-+
-+TEST_GEN_PROGS := hbf_hint_test
-+
-+include ../lib.mk
-+
-+CFLAGS += -Wall -O2
-
-diff --git a/tools/testing/selftests/hbf/hbf_hint_test.c b/tools/testing/selftests/hbf/hbf_hint_test.c
-new file mode 100644
-index 000000000000..dddddddddddd
---- /dev/null
-+++ b/tools/testing/selftests/hbf/hbf_hint_test.c
-@@ -0,0 +1,73 @@
-+// SPDX-License-Identifier: GPL-2.0
-+
 +#include <errno.h>
 +#include <fcntl.h>
 +#include <linux/hbf.h>
++#include <stdint.h>
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
 +#include <sys/ioctl.h>
 +#include <unistd.h>
 +
-+int main(void)
++static void usage(const char *prog)
 +{
-+	struct hbf_user_hint hint = {
-+		.version = HBF_UAPI_VERSION,
-+		.op = HBF_HINT_PREFETCH,
-+		.flags = HBF_HINT_F_ASYNC | HBF_HINT_F_READ_MOSTLY,
-+		.object_id = 1,
-+		.object_class = HBF_OBJECT_KV_CACHE,
-+		.target_node = -1,
-+	};
-+	void *buf;
-+	int fd, ret;
++	fprintf(stderr,
++		"Usage:\n"
++		"  %s --prefetch 0xADDR LEN\n"
++		"  %s --promote  0xADDR LEN\n"
++		"  %s --demote   0xADDR LEN\n"
++		"  %s --release  0xADDR LEN\n",
++		prog, prog, prog, prog);
++}
 +
-+	buf = aligned_alloc(4096, 4096 * 16);
-+	if (!buf) {
-+		perror("aligned_alloc");
-+		return 1;
-+	}
++static int parse_u64(const char *arg, uint64_t *out)
++{
++	char *end = NULL;
++	unsigned long long value;
 +
-+	memset(buf, 0, 4096 * 16);
-+	hint.va = (unsigned long)buf;
-+	hint.len = 4096 * 16;
++	errno = 0;
++	value = strtoull(arg, &end, 0);
++	if (errno || !end || *end != '\0')
++		return -1;
 +
-+	fd = open("/dev/hbfctl", O_RDONLY);
-+	if (fd < 0) {
-+		if (errno == ENOENT) {
-+			printf("SKIP: /dev/hbfctl not present\n");
-+			free(buf);
-+			return 4;
-+		}
-+		perror("open");
-+		free(buf);
-+		return 1;
-+	}
-+
-+	ret = ioctl(fd, HBF_IOC_SUBMIT_HINT, &hint);
-+	if (ret < 0 && errno == ENODEV) {
-+		printf("OK: no HBF devices registered\n");
-+		close(fd);
-+		free(buf);
-+		return 0;
-+	}
-+
-+	if (ret < 0) {
-+		perror("ioctl");
-+		close(fd);
-+		free(buf);
-+		return 1;
-+	}
-+
-+	printf("OK: HBF hint accepted\n");
-+	close(fd);
-+	free(buf);
++	*out = value;
 +	return 0;
 +}
 +
++static uint32_t parse_op(const char *arg)
++{
++	if (!strcmp(arg, "--prefetch"))
++		return HBF_HINT_PREFETCH;
++	if (!strcmp(arg, "--promote"))
++		return HBF_HINT_PROMOTE;
++	if (!strcmp(arg, "--demote"))
++		return HBF_HINT_DEMOTE;
++	if (!strcmp(arg, "--release"))
++		return HBF_HINT_RELEASE;
++	return 0;
++}
++
++int main(int argc, char **argv)
++{
++	struct hbf_hint_range hint = {
++		.version = HBF_UAPI_VERSION,
++		.target_nid = -1,
++	};
++	uint64_t start;
++	uint64_t len;
++	int fd;
++
++	if (argc != 4) {
++		usage(argv[0]);
++		return 2;
++	}
++
++	hint.op = parse_op(argv[1]);
++	if (!hint.op) {
++		usage(argv[0]);
++		return 2;
++	}
++
++	if (parse_u64(argv[2], &start) || parse_u64(argv[3], &len)) {
++		fprintf(stderr, "Invalid address or length.\n");
++		return 2;
++	}
++
++	hint.start = start;
++	hint.len = len;
++
++	fd = open("/dev/hbfctl", O_RDWR);
++	if (fd < 0) {
++		if (errno == ENOENT) {
++			fprintf(stderr,
++				"/dev/hbfctl not found. This is expected unless the RFC frontend is enabled.\n");
++			return 0;
++		}
++		perror("open");
++		return 1;
++	}
++
++	if (ioctl(fd, HBF_IOC_HINT, &hint) < 0) {
++		perror("ioctl(HBF_IOC_HINT)");
++		close(fd);
++		return 1;
++	}
++
++	printf("submitted hint op=%u start=0x%llx len=%llu\n",
++	       hint.op,
++	       (unsigned long long)hint.start,
++	       (unsigned long long)hint.len);
++	close(fd);
++	return 0;
++}
+\ No newline at end of file
+diff --git a/tools/testing/selftests/mm/hbf_hint_abi.c b/tools/testing/selftests/mm/hbf_hint_abi.c
+new file mode 100644
+index 0000000..9ebb920
+--- /dev/null
++++ b/tools/testing/selftests/mm/hbf_hint_abi.c
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/hbf.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++int main(void)
++{
++	struct hbf_hint_range hint = {
++		.version = HBF_UAPI_VERSION,
++		.op = HBF_HINT_PREFETCH,
++		.start = 0x1000,
++		.len = 0x1000,
++		.target_nid = -1,
++	};
++	int fd;
++
++	fd = open("/dev/hbfctl", O_RDWR);
++	if (fd < 0) {
++		if (errno == ENOENT) {
++			printf("SKIP: /dev/hbfctl not present\n");
++			return 4;
++		}
++		perror("open");
++		return 1;
++	}
++
++	if (ioctl(fd, HBF_IOC_HINT, &hint) < 0) {
++		if (errno == EOPNOTSUPP) {
++			printf("OK: skeleton returned EOPNOTSUPP\n");
++			close(fd);
++			return 0;
++		}
++		perror("ioctl");
++		close(fd);
++		return 1;
++	}
++
++	close(fd);
++	puts("OK: hint ioctl accepted");
++	return 0;
++}
+\ No newline at end of file
 -- 
-2.43.0
+2.52.0.windows.1
+

@@ -4,6 +4,12 @@
 
 The proposed control plane exists because the runtime and kernel each know something the other does not.
 
+Target model:
+
+- HBF-like warm capacity exposed through CXL Type-3, DAX, or memory hotplug
+- control-plane logic living close to `mm/`
+- `/dev/hbfctl` used only as an RFC frontend if present at all
+
 The runtime knows:
 
 - tokens
@@ -81,16 +87,6 @@ Typical intent:
 
 - "this range is cooling but should remain warm"
 
-### `PIN`
-
-Meaning:
-
-- request temporary placement stability
-
-Typical intent:
-
-- "do not move this range while a near-term operation depends on it"
-
 ### `RELEASE`
 
 Meaning:
@@ -125,6 +121,8 @@ The default expectation should be:
 - backends must remain free to reject hints based on policy or pressure
 
 The current prototype patch does not yet provide a complete security story. That is acceptable for RFC discussion only if the limitation is acknowledged clearly.
+
+For v1, pinning is intentionally omitted from the patch UAPI. If it returns later, it should likely be privileged and justified separately.
 
 ## Observability
 

@@ -14,6 +14,13 @@ This repository does **not** claim that:
 
 Instead, it explores whether runtime-guided prefetch, promote, demote, and placement hints could fit near existing Linux building blocks such as CXL, DAX, memory hotplug, memory tiering, NUMA policy, and migration.
 
+Target model:
+
+- HBF-like capacity tier exposed through CXL Type-3, DAX, or memory hotplug
+- HBF treated as a warm memory tier, not a block device
+- patch placement closer to `mm/` and `Documentation/mm/` than a standalone driver subtree
+- `/dev/hbfctl` accepted only as an RFC frontend, not a long-term ABI commitment
+
 ## Problem Statement
 
 Inference runtimes increasingly manage memory hierarchies that look like this:
@@ -43,6 +50,7 @@ That makes Linux the natural place to evaluate an advisory hint interface, espec
 ## Proposed Architecture
 
 The proposal is a thin runtime-to-kernel control plane, not a replacement for CXL, DAX, or memory tiering.
+The current prototype patch is intentionally `mm`-oriented rather than driver-first.
 
 ```mermaid
 flowchart TD
@@ -88,6 +96,7 @@ The control plane is intentionally advisory:
 - [docs/api-options.md](docs/api-options.md): comparison of ABI surfaces
 - [docs/control-plane.md](docs/control-plane.md): detailed control-plane model
 - [docs/kernel-integration-map.md](docs/kernel-integration-map.md): potential subsystem landing points
+- [docs/no-block-layer.md](docs/no-block-layer.md): why the first serious RFC should target memory-tiering, not the block layer
 - [docs/benchmark-plan.md](docs/benchmark-plan.md): proxy experiments in lieu of real hardware
 - [docs/tracepoints.md](docs/tracepoints.md): observability proposal
 - [docs/testing.md](docs/testing.md): local checks and readiness steps
