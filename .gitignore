@@ -1,0 +1,36 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.ko
+*.mod
+*.mod.c
+*.cmd
+*.d
+*.elf
+*.out
+
+# Userspace examples
+/examples/hbfctl-demo
+/examples/*.o
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*~
+
+# Python helpers
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+venv/
+env/
