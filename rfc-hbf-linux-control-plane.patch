@@ -112,22 +112,22 @@ index 000000000000..444444444444
 +
 +endif
 +
-+diff --git a/drivers/memory/hbf/Kconfig.debug b/drivers/memory/hbf/Kconfig.debug
-+new file mode 100644
-+index 000000000000..555555555555
-+--- /dev/null
-++++ b/drivers/memory/hbf/Kconfig.debug
-+@@ -0,0 +1,10 @@
-++# SPDX-License-Identifier: GPL-2.0
-++
-++config HBF_DEBUG
-++	bool "HBF debug logging"
-++	depends on HBF
-++	help
-++	  Enable additional debug logging in the HBF control plane.
-++
-++	  This is intended only for development of HBF policy and hardware
-++	  drivers.
+diff --git a/drivers/memory/hbf/Kconfig.debug b/drivers/memory/hbf/Kconfig.debug
+new file mode 100644
+index 000000000000..555555555555
+--- /dev/null
++++ b/drivers/memory/hbf/Kconfig.debug
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: GPL-2.0
++
++config HBF_DEBUG
++	bool "HBF debug logging"
++	depends on HBF
++	help
++	  Enable additional debug logging in the HBF control plane.
++
++	  This is intended only for development of HBF policy and hardware
++	  drivers.
 
 diff --git a/drivers/memory/hbf/Makefile b/drivers/memory/hbf/Makefile
 new file mode 100644

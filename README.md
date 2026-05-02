@@ -97,6 +97,8 @@ The control plane is intentionally advisory:
 - [scripts/check-patch.sh](scripts/check-patch.sh): local patch and example validation helper
 - [scripts/make-rfc-series.sh](scripts/make-rfc-series.sh): instructions for generating patch series from commits
 
+The patch file is a prototype artifact. It must be regenerated from commits before any real upstream discussion.
+
 ## Build And Check
 
 Local checks:
