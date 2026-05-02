@@ -1,5 +1,5 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
 
 PATCH_FILE="rfc-hbf-linux-control-plane.patch"
 EXAMPLE_SRC="examples/hbfctl-demo.c"

@@ -1,18 +1,35 @@
 # Testing
 
-## Basic Validation
+## Local Validation
 
-Run the local helper:
+Run:
 
 ```bash
 ./scripts/check-patch.sh
 ```
 
-That script is expected to:
+The script should:
 
 - verify that `rfc-hbf-linux-control-plane.patch` exists
-- run `checkpatch.pl` if `KERNEL_TREE` points at a Linux source tree
-- compile `examples/hbfctl-demo.c` with `gcc -Wall -Wextra -O2`
+- compile `examples/hbfctl-demo.c`
+- run `scripts/checkpatch.pl --strict` when `KERNEL_TREE` is set
+- print instructions when `KERNEL_TREE` is absent
+
+The absence of `KERNEL_TREE` should not be treated as a failure. C compile failures should.
+
+## Kernel Workflow References
+
+Before any manual RFC preparation in a real kernel tree, review:
+
+- Linux patch submission guide:
+  [https://kernel.org/doc/html/next/process/submitting-patches.html](https://kernel.org/doc/html/next/process/submitting-patches.html)
+- Linux patch submission checklist:
+  [https://www.kernel.org/doc/html/latest/process/submit-checklist.html](https://www.kernel.org/doc/html/latest/process/submit-checklist.html)
+
+And run:
+
+- `scripts/checkpatch.pl`
+- `sparse`
 
 ## Patch Style
 
@@ -25,53 +42,44 @@ $KERNEL_TREE/scripts/checkpatch.pl --strict rfc-hbf-linux-control-plane.patch
 
 ## Static Checking
 
-Within a suitable Linux tree, the RFC code should be evaluated with:
-
-- `scripts/checkpatch.pl`
-- `sparse`
-
-Example direction:
+Within a suitable Linux tree, prefer checks such as:
 
 ```bash
 make C=1 CF="-D__CHECK_ENDIAN__" M=path/to/rfc/code
 ```
 
-## Formatting Guidance
+The point is not to declare the prototype ready. The point is to keep the mechanics honest while the design is still under debate.
 
-Use kernel style for kernel material.
+## Userspace Example Checks
 
-Use `clang-format` only for userspace examples such as `examples/hbfctl-demo.c`, not as a substitute for kernel coding style in patch content.
-
-## Mock Test Plan
-
-1. Compile `examples/hbfctl-demo.c`.
-2. Confirm the UAPI-like structs and ioctl definitions compile cleanly.
-3. If a mock `/dev/hbfctl` exists, run the sample with `--prefetch`, `--promote`, and `--demote`.
-4. Confirm that absent-device behavior is friendly and clearly explains the RFC/mock status.
-
-Example commands:
+Compile the demo:
 
 ```bash
 gcc -Wall -Wextra -O2 -o examples/hbfctl-demo examples/hbfctl-demo.c
+```
+
+Run examples:
+
+```bash
 ./examples/hbfctl-demo --prefetch 0x100000 4096
 ./examples/hbfctl-demo --promote 0x200000 8192
 ./examples/hbfctl-demo --demote 0x300000 4096
+./examples/hbfctl-demo --pin 0x400000 4096
+./examples/hbfctl-demo --release 0x500000 4096
 ```
 
-## Future Real-Hardware Test Areas
+Expected behavior without a prototype kernel implementation:
 
-If real hardware or realistic emulation emerges, useful next-stage validation would include:
+- friendly message that `/dev/hbfctl` is absent
+- no claim that the interface exists upstream
 
-- CXL memory device exposure and management
-- DAX mapping behavior
+## Future Validation
+
+If a real backend or credible proxy backend appears later, useful tests include:
+
+- CXL or DAX-backed capacity exposure
 - page migration latency across tiers
-- KV-cache trace replay from inference runtimes
-- eBPF and tracepoint visibility for hint -> prefetch -> fault latency
-
-## Success Criteria for Early RFCs
-
-For this repository, success is not benchmark leadership. Success is:
-
-- a credible kernel-facing abstraction
-- code and docs that survive basic kernel review expectations
-- a test surface that can grow once a backend becomes concrete
+- trace replay of KV-cache access patterns
+- hint acceptance versus actual prefetch completion
+- fault-after-hint timing
+- accounting behavior under memory pressure
