@@ -1,0 +1,5 @@
+docs/** linguist-documentation
+*.md linguist-documentation
+*.patch linguist-detectable=false
+scripts/*.sh linguist-detectable=false
+examples/*.c linguist-language=C
