@@ -1,5 +1,9 @@
 docs/** linguist-documentation
 *.md linguist-documentation
-*.patch linguist-detectable=false
-scripts/*.sh linguist-detectable=false
-examples/*.c linguist-language=C
+
+# Keep RFC artifacts out of the language bar.
+*.patch linguist-generated=true linguist-detectable=false
+scripts/** linguist-generated=true linguist-detectable=false
+
+# Ensure the example source is counted as C.
+examples/*.c linguist-language=C linguist-detectable=true -linguist-generated -linguist-vendored
