@@ -1,7 +1,7 @@
 From a708e21dfde66b861d939085a64a49a70bb3147c Mon Sep 17 00:00:00 2001
 From: Manish KL <manishklach@gmail.com>
 Date: Fri, 10 Jul 2026 00:47:38 -0700
-Subject: [PATCH 1/8] doc: mm: describe runtime-guided memory tiering
+Subject: [PATCH 1/9] doc: mm: describe runtime-guided memory tiering
 
 Add documentation for the Heterogeneous Memory Control Plane, covering:
 - Memory tier model (hot/warm/cold)

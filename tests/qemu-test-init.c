@@ -105,6 +105,22 @@ static void test_deadline_reject(int fd)
 	munmap(buf, 4096);
 }
 
+static void test_cxl_debugfs(void)
+{
+	FILE *f = fopen("/sys/kernel/debug/hbf/cxl/nodes", "r");
+	char buf[128];
+
+	if (!f) {
+		printf("  OK: /sys/kernel/debug/hbf/cxl/nodes not found "
+		       "(no CXL hardware)\n");
+		return;
+	}
+
+	while (fgets(buf, sizeof(buf), f))
+		printf("  cxl: %s", buf);
+	fclose(f);
+}
+
 static void test_multi_submit(int fd)
 {
 	void *buf;
@@ -151,6 +167,7 @@ int main(void)
 	test_submit_query(fd);
 	test_deadline_reject(fd);
 	test_multi_submit(fd);
+	test_cxl_debugfs();
 
 	printf("\n");
 	if (failures == 0)

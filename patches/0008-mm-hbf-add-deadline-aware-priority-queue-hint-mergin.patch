@@ -1,7 +1,7 @@
 From 1e8b220f900041c88344a9a6d3ada4cae6d0556b Mon Sep 17 00:00:00 2001
 From: Manish KL <manishklach@gmail.com>
 Date: Fri, 10 Jul 2026 05:00:24 -0700
-Subject: [PATCH 8/8] mm: hbf: add deadline-aware priority queue, hint merging,
+Subject: [PATCH 8/9] mm: hbf: add deadline-aware priority queue, hint merging,
  multi-node NUMA test
 
 - Replace FIFO queue with deadline-sorted priority queue

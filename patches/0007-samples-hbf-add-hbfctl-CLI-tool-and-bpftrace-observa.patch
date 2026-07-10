@@ -1,7 +1,7 @@
 From 55853e9a22e17759afde993926c4402067fd6d69 Mon Sep 17 00:00:00 2001
 From: Manish KL <manishklach@gmail.com>
 Date: Fri, 10 Jul 2026 00:48:22 -0700
-Subject: [PATCH 7/8] samples: hbf: add hbfctl CLI tool and bpftrace
+Subject: [PATCH 7/9] samples: hbf: add hbfctl CLI tool and bpftrace
  observability scripts
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

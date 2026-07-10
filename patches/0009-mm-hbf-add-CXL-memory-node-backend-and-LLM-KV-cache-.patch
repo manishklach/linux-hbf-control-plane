@@ -1,0 +1,591 @@
+From f37bfb09c420ed1865406db5d28ed1c879fcf5a8 Mon Sep 17 00:00:00 2001
+From: Manish KL <manishklach@gmail.com>
+Date: Fri, 10 Jul 2026 05:25:45 -0700
+Subject: [PATCH 9/9] mm: hbf: add CXL memory-node backend and LLM KV-cache
+ monitor
+
+- hbf_cxl.c: new CXL backend that identifies memory-only NUMA nodes
+  (nodes with N_MEMORY but no N_CPU) as CXL-attached memory and
+  handles page migration to/from them using the same folio-based
+  migration pipeline as the NUMA backend
+- Debugfs: /sys/kernel/debug/hbf/cxl/nodes shows detected CXL nodes
+  with their memory sizes
+- Registration order: CXL backend registered before NUMA backend so
+  it takes priority for CXL nodes; NUMA backend handles everything else
+- hbfctl: add cxl command to display CXL node info from debugfs
+- tools/hbftrace/kvcache_monitor.py: Python monitor that watches
+  /proc/PID/numa_maps for pages on suboptimal NUMA nodes and submits
+  HBF promote hints; supports vLLM/llama.cpp KV-cache monitoring
+- Export hbf_debugfs_root via hbf_get_debugfs_root() accessor
+---
+ mm/hbf/Makefile                   |   1 +
+ mm/hbf/hbf_cxl.c                  | 185 ++++++++++++++++++++++++++
+ mm/hbf/hbf_cxl.h                  |   8 ++
+ mm/hbf/hbf_debugfs.c              |   5 +
+ mm/hbf/hbf_debugfs.h              |   3 +
+ mm/hbf/hbf_main.c                 |   6 +
+ samples/hbf/hbfctl.c              |  21 ++-
+ tools/hbftrace/kvcache_monitor.py | 211 ++++++++++++++++++++++++++++++
+ 8 files changed, 439 insertions(+), 1 deletion(-)
+ create mode 100755 mm/hbf/hbf_cxl.c
+ create mode 100755 mm/hbf/hbf_cxl.h
+ create mode 100755 tools/hbftrace/kvcache_monitor.py
+
+diff --git a/mm/hbf/Makefile b/mm/hbf/Makefile
+index 5774d72ab..a2bb94545 100644
+--- a/mm/hbf/Makefile
++++ b/mm/hbf/Makefile
+@@ -8,5 +8,6 @@ hbf-objs := \
+ 	hbf_request.o \
+ 	hbf_backend.o \
+ 	hbf_numa.o \
++	hbf_cxl.o \
+ 	hbf_debugfs.o \
+ 	hbf_tracepoints.o
+diff --git a/mm/hbf/hbf_cxl.c b/mm/hbf/hbf_cxl.c
+new file mode 100755
+index 000000000..0d33389e4
+--- /dev/null
++++ b/mm/hbf/hbf_cxl.c
+@@ -0,0 +1,185 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/mm.h>
++#include <linux/mmzone.h>
++#include <linux/migrate.h>
++#include <linux/sched/mm.h>
++#include <linux/gfp.h>
++#include <linux/pagemap.h>
++#include <linux/err.h>
++#include <linux/nodemask.h>
++#include <linux/seq_file.h>
++#include <linux/debugfs.h>
++#include "hbf_backend.h"
++#include "hbf_cxl.h"
++#include "hbf_debugfs.h"
++
++static struct dentry *cxl_debugfs_dir;
++
++/* Detect CXL nodes: memory-only nodes with no CPUs */
++static bool is_cxl_node(int nid)
++{
++	if (!node_online(nid))
++		return false;
++	if (!node_state(nid, N_MEMORY))
++		return false;
++	if (node_state(nid, N_CPU))
++		return false;
++	return true;
++}
++
++static bool cxl_supports_target(int nid)
++{
++	return is_cxl_node(nid);
++}
++
++static int cxl_query_range(struct mm_struct *mm, unsigned long start,
++			   unsigned long len, int *src_nid)
++{
++	return -EOPNOTSUPP;
++}
++
++static int cxl_migrate_range(struct mm_struct *mm, unsigned long start,
++			     unsigned long len, int target_nid)
++{
++	unsigned long addr;
++	int ret;
++	unsigned int nr_succeeded;
++	LIST_HEAD(folio_list);
++
++	if (!mm)
++		return -ESRCH;
++
++	addr = start;
++	while (addr < start + len) {
++		struct page *page;
++		struct folio *folio;
++		int nr_pinned;
++		int nr_folio_pages;
++
++		nr_pinned = get_user_pages_fast(addr, 1, FOLL_GET, &page);
++		if (nr_pinned <= 0) {
++			addr += PAGE_SIZE;
++			continue;
++		}
++
++		folio = page_folio(page);
++		if (folio_nid(folio) == target_nid) {
++			put_page(page);
++			addr += PAGE_SIZE;
++			continue;
++		}
++
++		if (!isolate_folio_to_list(folio, &folio_list)) {
++			put_page(page);
++			addr += PAGE_SIZE;
++			continue;
++		}
++
++		nr_folio_pages = folio_nr_pages(folio);
++		put_page(page);
++		addr += nr_folio_pages * PAGE_SIZE;
++	}
++
++	if (list_empty(&folio_list))
++		return 0;
++
++	nr_succeeded = 0;
++	ret = migrate_pages(&folio_list, alloc_migration_target, NULL,
++			    (unsigned long)target_nid, MIGRATE_SYNC,
++			    MR_NUMA_MISPLACED, &nr_succeeded);
++	if (ret < 0) {
++		if (!list_empty(&folio_list))
++			putback_movable_pages(&folio_list);
++		return ret;
++	}
++
++	if (!list_empty(&folio_list))
++		putback_movable_pages(&folio_list);
++
++	return nr_succeeded;
++}
++
++static int cxl_promote_range(struct mm_struct *mm, unsigned long start,
++			     unsigned long len, int target_nid)
++{
++	return cxl_migrate_range(mm, start, len, target_nid);
++}
++
++static int cxl_demote_range(struct mm_struct *mm, unsigned long start,
++			    unsigned long len, int target_nid)
++{
++	return cxl_migrate_range(mm, start, len, target_nid);
++}
++
++static int cxl_prefetch_range(struct mm_struct *mm, unsigned long start,
++			      unsigned long len, int target_nid)
++{
++	return cxl_migrate_range(mm, start, len, target_nid);
++}
++
++static int cxl_release_range(struct mm_struct *mm, unsigned long start,
++			     unsigned long len)
++{
++	return 0;
++}
++
++static const struct hbf_backend_ops cxl_backend_ops = {
++	.name		= "cxl",
++	.query_range	= cxl_query_range,
++	.prefetch_range	= cxl_prefetch_range,
++	.promote_range	= cxl_promote_range,
++	.demote_range	= cxl_demote_range,
++	.release_range	= cxl_release_range,
++	.supports_target	= cxl_supports_target,
++};
++
++static int cxl_nodes_show(struct seq_file *m, void *v)
++{
++	int nid;
++
++	seq_puts(m, "CXL memory nodes:\n");
++	for_each_node_state(nid, N_MEMORY) {
++		if (is_cxl_node(nid)) {
++			unsigned long total = 0;
++			struct zone *zone;
++			enum zone_type z;
++
++	for (z = 0; z < MAX_NR_ZONES; z++) {
++			zone = &NODE_DATA(nid)->node_zones[z];
++			total += zone->present_pages;
++		}
++
++			seq_printf(m, "  node %d: %lu MB\n",
++				   nid, (total * PAGE_SIZE) >> 20);
++		}
++	}
++	return 0;
++}
++
++DEFINE_SHOW_ATTRIBUTE(cxl_nodes);
++
++int hbf_cxl_register(void)
++{
++	int ret;
++	struct dentry *root;
++
++	ret = hbf_register_backend(&cxl_backend_ops);
++	if (ret)
++		return ret;
++
++	root = hbf_get_debugfs_root();
++	if (root) {
++		cxl_debugfs_dir = debugfs_create_dir("cxl", root);
++		if (!IS_ERR(cxl_debugfs_dir))
++			debugfs_create_file("nodes", 0444, cxl_debugfs_dir,
++					   NULL, &cxl_nodes_fops);
++	}
++
++	return 0;
++}
++
++void hbf_cxl_unregister(void)
++{
++	hbf_unregister_backend(&cxl_backend_ops);
++	debugfs_remove_recursive(cxl_debugfs_dir);
++}
+diff --git a/mm/hbf/hbf_cxl.h b/mm/hbf/hbf_cxl.h
+new file mode 100755
+index 000000000..c98354bfb
+--- /dev/null
++++ b/mm/hbf/hbf_cxl.h
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _HBF_CXL_H
++#define _HBF_CXL_H
++
++int hbf_cxl_register(void);
++void hbf_cxl_unregister(void);
++
++#endif /* _HBF_CXL_H */
+\ No newline at end of file
+diff --git a/mm/hbf/hbf_debugfs.c b/mm/hbf/hbf_debugfs.c
+index 90c8469d3..7761e0eaa 100644
+--- a/mm/hbf/hbf_debugfs.c
++++ b/mm/hbf/hbf_debugfs.c
+@@ -100,3 +100,8 @@ void hbf_exit_debugfs(void)
+ {
+ 	debugfs_remove_recursive(hbf_debugfs_root);
+ }
++
++struct dentry *hbf_get_debugfs_root(void)
++{
++	return hbf_debugfs_root;
++}
+diff --git a/mm/hbf/hbf_debugfs.h b/mm/hbf/hbf_debugfs.h
+index a4d0f8792..654ba57a2 100644
+--- a/mm/hbf/hbf_debugfs.h
++++ b/mm/hbf/hbf_debugfs.h
+@@ -3,10 +3,12 @@
+ #define _HBF_DEBUGFS_H
+ 
+ #include <linux/types.h>
++#include <linux/dcache.h>
+ 
+ #ifdef CONFIG_DEBUG_FS
+ int hbf_init_debugfs(void);
+ void hbf_exit_debugfs(void);
++struct dentry *hbf_get_debugfs_root(void);
+ void hbf_stat_inc_submitted(void);
+ void hbf_stat_inc_accepted(void);
+ void hbf_stat_inc_rejected(void);
+@@ -18,6 +20,7 @@ void hbf_stat_add_bytes_moved(u64 bytes);
+ #else
+ static inline int hbf_init_debugfs(void) { return 0; }
+ static inline void hbf_exit_debugfs(void) { }
++static inline struct dentry *hbf_get_debugfs_root(void) { return NULL; }
+ static inline void hbf_stat_inc_submitted(void) { }
+ static inline void hbf_stat_inc_accepted(void) { }
+ static inline void hbf_stat_inc_rejected(void) { }
+diff --git a/mm/hbf/hbf_main.c b/mm/hbf/hbf_main.c
+index b4f6d0241..f5a3143d5 100644
+--- a/mm/hbf/hbf_main.c
++++ b/mm/hbf/hbf_main.c
+@@ -7,6 +7,7 @@
+ #include "hbf_backend.h"
+ #include "hbf_ioctl.h"
+ #include "hbf_numa.h"
++#include "hbf_cxl.h"
+ 
+ #define HBF_DEVICE_NAME	"hbfctl"
+ 
+@@ -41,6 +42,10 @@ static int __init hbf_init(void)
+ 	if (ret)
+ 		goto err_misc;
+ 
++	ret = hbf_cxl_register();
++	if (ret)
++		pr_warn("hbf: CXL backend not available\n");
++
+ 	ret = hbf_numa_register();
+ 	if (ret)
+ 		pr_warn("hbf: NUMA backend not available\n");
+@@ -58,6 +63,7 @@ static int __init hbf_init(void)
+ 
+ static void __exit hbf_exit(void)
+ {
++	hbf_cxl_unregister();
+ 	hbf_numa_unregister();
+ 	misc_deregister(&hbf_miscdev);
+ 	hbf_exit_debugfs();
+diff --git a/samples/hbf/hbfctl.c b/samples/hbf/hbfctl.c
+index b416dce6c..c850d46aa 100644
+--- a/samples/hbf/hbfctl.c
++++ b/samples/hbf/hbfctl.c
+@@ -173,7 +173,6 @@ static int cmd_caps(int argc, char **argv)
+ 
+ static int cmd_status(int argc, char **argv)
+ {
+-	// Reads debugfs stats
+ 	FILE *f = fopen("/sys/kernel/debug/hbf/stats", "r");
+ 	char buf[256];
+ 
+@@ -189,12 +188,30 @@ static int cmd_status(int argc, char **argv)
+ 	return 0;
+ }
+ 
++static int cmd_cxl(int argc, char **argv)
++{
++	FILE *f = fopen("/sys/kernel/debug/hbf/cxl/nodes", "r");
++	char buf[256];
++
++	if (!f) {
++		perror("open debugfs cxl/nodes");
++		return 1;
++	}
++
++	while (fgets(buf, sizeof(buf), f))
++		printf("%s", buf);
++
++	fclose(f);
++	return 0;
++}
++
+ int main(int argc, char **argv)
+ {
+ 	if (argc < 2) {
+ 		fprintf(stderr, "Usage: hbfctl <command> [args...]\n");
+ 		fprintf(stderr, "Commands:\n");
+ 		fprintf(stderr, "  submit  <addr> <len> -o <op> -n <nid> [-d deadline_ns] [-t tag]\n");
++		fprintf(stderr, "  cxl\n");
+ 		fprintf(stderr, "  query   <request_id>\n");
+ 		fprintf(stderr, "  cancel  <request_id>\n");
+ 		fprintf(stderr, "  caps\n");
+@@ -212,6 +229,8 @@ int main(int argc, char **argv)
+ 		return cmd_caps(argc - 2, argv + 2);
+ 	if (strcmp(argv[1], "status") == 0)
+ 		return cmd_status(argc - 2, argv + 2);
++	if (strcmp(argv[1], "cxl") == 0)
++		return cmd_cxl(argc - 2, argv + 2);
+ 
+ 	fprintf(stderr, "Unknown command: %s\n", argv[1]);
+ 	return 1;
+diff --git a/tools/hbftrace/kvcache_monitor.py b/tools/hbftrace/kvcache_monitor.py
+new file mode 100755
+index 000000000..12fd55e94
+--- /dev/null
++++ b/tools/hbftrace/kvcache_monitor.py
+@@ -0,0 +1,211 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0
++"""
++kvcache_monitor.py — Watch an LLM inference process and submit HBF hints
++for KV-cache pages on suboptimal NUMA/CXL nodes.
++
++Usage:
++  # Monitor a running vLLM or llama.cpp process:
++  python3 kvcache_monitor.py --pid 1234 --interval 2
++
++  # Dry-run (print what would be submitted without actually doing it):
++  python3 kvcache_monitor.py --pid 1234 --dry-run
++
++  # Specify target NUMA node (default: nearest CPU node to CXL memory):
++  python3 kvcache_monitor.py --pid 1234 --target-node 0
++
++Requires:
++  - Linux with /proc/PID/numa_maps
++  - hbfctl in PATH (or HBFCTL env var pointing to it)
++  - Root or CAP_SYS_ADMIN for /proc/PID/numa_maps
++"""
++import argparse
++import os
++import re
++import subprocess
++import sys
++import time
++
++
++def find_hbfctl():
++    env = os.environ.get("HBFCTL")
++    if env:
++        return env
++    for path in ["/usr/local/bin/hbfctl", "/usr/bin/hbfctl", "./hbfctl"]:
++        if os.path.isfile(path) and os.access(path, os.X_OK):
++            return path
++    return "hbfctl"
++
++
++def read_numa_maps(pid):
++    path = f"/proc/{pid}/numa_maps"
++    try:
++        with open(path) as f:
++            return f.readlines()
++    except FileNotFoundError:
++        return None
++    except PermissionError:
++        print(f"ERROR: Permission denied reading {path} (try as root)", file=sys.stderr)
++        sys.exit(1)
++
++
++def parse_numa_maps(lines, preferred_node):
++    candidates = []
++    for line in lines:
++        parts = line.split()
++        if len(parts) < 2:
++            continue
++        addr_range = parts[0]
++        if "-" not in addr_range:
++            continue
++        start_str, end_str = addr_range.split("-", 1)
++        try:
++            start = int(start_str, 16)
++            end = int(end_str, 16)
++        except ValueError:
++            continue
++
++        if end - start > (512 << 20):
++            continue
++
++        policy = None
++        node_pages = {}
++        for token in parts[1:]:
++            if token.startswith("policy="):
++                policy = token[7:]
++            elif re.match(r'^N\d+=\d+$', token):
++                nid_str, count_str = token.split("=")
++                nid = int(nid_str[1:])
++                count = int(count_str)
++                if count > 0:
++                    node_pages[nid] = count
++
++        if not policy or not node_pages:
++            continue
++
++        pages_on_preferred = node_pages.get(preferred_node, 0)
++        total_pages = sum(node_pages.values())
++        if total_pages == 0:
++            continue
++
++        ratio = pages_on_preferred / total_pages
++        if ratio < 0.5:
++            candidates.append((start, end, start, end - start, policy, node_pages))
++
++    return candidates
++
++
++def submit_hint(hbfctl, start, length, op, target_nid, dry_run):
++    cmd = [hbfctl, "submit", hex(start), str(length),
++           "-o", str(op), "-n", str(target_nid)]
++    if dry_run:
++        print(f"  (dry-run) {' '.join(cmd)}")
++        return True
++    try:
++        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
++        if result.returncode == 0:
++            return True
++        else:
++            print(f"  submit failed: {result.stderr.strip()}", file=sys.stderr)
++            return False
++    except FileNotFoundError:
++        print(f"ERROR: {hbfctl} not found. Install hbfctl or set HBFCTL env var.",
++              file=sys.stderr)
++        sys.exit(1)
++    except subprocess.TimeoutExpired:
++        print("  submit timed out", file=sys.stderr)
++        return False
++
++
++def main():
++    parser = argparse.ArgumentParser(
++        description="Monitor LLM KV-cache and submit HBF migration hints")
++    parser.add_argument("--pid", type=int, required=True,
++                        help="PID of the LLM process to monitor")
++    parser.add_argument("--interval", type=float, default=2.0,
++                        help="Polling interval in seconds (default: 2.0)")
++    parser.add_argument("--target-node", type=int, default=None,
++                        help="Target NUMA node for promotion (default: auto-detect)")
++    parser.add_argument("--min-bytes", type=int, default=4096,
++                        help="Minimum range size in bytes to hint (default: 4096)")
++    parser.add_argument("--dry-run", action="store_true",
++                        help="Print hints without submitting")
++    parser.add_argument("--op", type=int, default=2,
++                        choices=[1, 2, 3, 4],
++                        help="HBF operation: 1=prefetch, 2=promote, 3=demote, 4=release")
++    args = parser.parse_args()
++
++    hbfctl = find_hbfctl()
++
++    if not os.path.isdir(f"/proc/{args.pid}"):
++        print(f"ERROR: Process {args.pid} not running", file=sys.stderr)
++        sys.exit(1)
++
++    if args.target_node is None:
++        try:
++            with open(f"/proc/{args.pid}/status") as f:
++                for line in f:
++                    if line.startswith("Mems_allowed_list:"):
++                        mems = line.strip().split(":")[1].strip()
++                        nodes = []
++                        for part in mems.split(","):
++                            if "-" in part:
++                                a, b = part.split("-")
++                                nodes.extend(range(int(a), int(b) + 1))
++                            else:
++                                nodes.append(int(part))
++                        if nodes:
++                            args.target_node = nodes[0]
++                            break
++        except Exception:
++            pass
++
++        if args.target_node is None:
++            args.target_node = 0
++
++    print(f"HBF KV-cache Monitor")
++    print(f"  PID:          {args.pid}")
++    print(f"  Target node:  {args.target_node}")
++    print(f"  Interval:     {args.interval}s")
++    print(f"  Operation:    {args.op}")
++    print(f"  hbfctl:       {hbfctl}")
++    if args.dry_run:
++        print(f"  DRY RUN: no hints will be submitted")
++    print()
++
++    iteration = 0
++    while True:
++        lines = read_numa_maps(args.pid)
++        if lines is None:
++            print(f"Process {args.pid} has exited.")
++            break
++
++        candidates = parse_numa_maps(lines, args.target_node)
++        total_misplaced = sum((end - start) for _, _, start, end, _, _ in candidates)
++        total_pages = sum(
++            sum(count for _, count in pages.items())
++            for _, _, _, _, _, pages in candidates
++        )
++
++        print(f"[{iteration}] Scanned {len(lines)} VMA regions, "
++              f"{len(candidates)} mis-placed ranges "
++              f"({total_misplaced >> 20} MB on wrong node)", end="")
++
++        hints_submitted = 0
++        for start, end, actual_start, actual_len, policy, pages in candidates:
++            if actual_len < args.min_bytes:
++                continue
++            if hints_submitted >= 8:
++                break
++            if submit_hint(hbfctl, actual_start, actual_len,
++                          args.op, args.target_node, args.dry_run):
++                hints_submitted += 1
++
++        print(f", {hints_submitted} hints submitted")
++
++        iteration += 1
++        time.sleep(args.interval)
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+
