@@ -1,7 +1,7 @@
 From da145e5599c3261425a896e27a079ce6796eee87 Mon Sep 17 00:00:00 2001
 From: Manish KL <manishklach@gmail.com>
 Date: Fri, 10 Jul 2026 00:48:07 -0700
-Subject: [PATCH 5/7] mm: hbf: add NUMA migration backend
+Subject: [PATCH 5/8] mm: hbf: add NUMA migration backend
 
 Implements the pluggable backend ops for page movement:
 

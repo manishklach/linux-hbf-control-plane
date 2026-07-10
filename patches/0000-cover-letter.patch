@@ -1,14 +1,14 @@
-From 55853e9a22e17759afde993926c4402067fd6d69 Mon Sep 17 00:00:00 2001
+From 1e8b220f900041c88344a9a6d3ada4cae6d0556b Mon Sep 17 00:00:00 2001
 From: Manish KL <manishklach@gmail.com>
-Date: Fri, 10 Jul 2026 01:32:30 -0700
-Subject: [PATCH 0/7] *** SUBJECT HERE ***
+Date: Fri, 10 Jul 2026 05:00:36 -0700
+Subject: [PATCH 0/8] *** SUBJECT HERE ***
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
 *** BLURB HERE ***
 
-Manish KL (7):
+Manish KL (8):
   doc: mm: describe runtime-guided memory tiering
   mm: hbf: add internal memory range hint types
   mm: hbf: add observability for range hint lifecycle
@@ -16,38 +16,40 @@ Manish KL (7):
   mm: hbf: add NUMA migration backend
   selftests: mm: add HBF hint ABI, migration, and cancellation tests
   samples: hbf: add hbfctl CLI tool and bpftrace observability scripts
+  mm: hbf: add deadline-aware priority queue, hint merging, multi-node
+    NUMA test
 
- Documentation/mm/hbf-control-plane.rst        | 228 +++++++++++
- include/trace/events/hbf.h                    | 249 ++++++++++++
- include/uapi/linux/hbf.h                      |  56 +++
+ Documentation/mm/hbf-control-plane.rst        | 228 ++++++++
+ include/trace/events/hbf.h                    | 249 ++++++++
+ include/uapi/linux/hbf.h                      |  56 ++
  mm/Kconfig                                    |   1 +
  mm/Makefile                                   |   1 +
  mm/hbf/Kconfig                                |  14 +
  mm/hbf/Makefile                               |  12 +
- mm/hbf/hbf_backend.c                          |  71 ++++
+ mm/hbf/hbf_backend.c                          |  71 +++
  mm/hbf/hbf_backend.h                          |  33 ++
- mm/hbf/hbf_debugfs.c                          | 103 +++++
- mm/hbf/hbf_debugfs.h                          |  13 +
- mm/hbf/hbf_ioctl.c                            | 140 +++++++
+ mm/hbf/hbf_debugfs.c                          | 102 ++++
+ mm/hbf/hbf_debugfs.h                          |  31 +
+ mm/hbf/hbf_ioctl.c                            | 140 +++++
  mm/hbf/hbf_ioctl.h                            |   7 +
- mm/hbf/hbf_main.c                             |  73 ++++
- mm/hbf/hbf_numa.c                             | 131 ++++++
+ mm/hbf/hbf_main.c                             |  73 +++
+ mm/hbf/hbf_numa.c                             | 131 +++++
  mm/hbf/hbf_numa.h                             |   8 +
- mm/hbf/hbf_request.c                          | 374 ++++++++++++++++++
- mm/hbf/hbf_request.h                          |  50 +++
+ mm/hbf/hbf_request.c                          | 533 ++++++++++++++++++
+ mm/hbf/hbf_request.h                          |  50 ++
  mm/hbf/hbf_tracepoints.c                      |   3 +
- mm/hbf/hbf_tracepoints.h                      | 253 ++++++++++++
- mm/hbf/hbf_types.h                            |  58 +++
+ mm/hbf/hbf_tracepoints.h                      | 253 +++++++++
+ mm/hbf/hbf_types.h                            |  58 ++
  samples/hbf/Makefile                          |   2 +
- samples/hbf/hbfctl.c                          | 218 ++++++++++
- tools/hbftrace/hbf_deadline_misses.py         |  61 +++
- tools/hbftrace/hbf_latency.py                 |  70 ++++
- tools/hbftrace/hbf_migrations.py              |  76 ++++
- tools/testing/selftests/mm/hbf_cancel.c       |  72 ++++
- tools/testing/selftests/mm/hbf_hint_abi.c     | 107 +++++
- .../testing/selftests/mm/hbf_promote_demote.c | 146 +++++++
- .../testing/selftests/mm/hbf_reject_invalid.c |  76 ++++
- 30 files changed, 2706 insertions(+)
+ samples/hbf/hbfctl.c                          | 218 +++++++
+ tools/hbftrace/hbf_deadline_misses.py         |  61 ++
+ tools/hbftrace/hbf_latency.py                 |  70 +++
+ tools/hbftrace/hbf_migrations.py              |  76 +++
+ tools/testing/selftests/mm/hbf_cancel.c       |  72 +++
+ tools/testing/selftests/mm/hbf_hint_abi.c     | 107 ++++
+ .../testing/selftests/mm/hbf_promote_demote.c | 146 +++++
+ .../testing/selftests/mm/hbf_reject_invalid.c |  76 +++
+ 30 files changed, 2882 insertions(+)
  create mode 100644 Documentation/mm/hbf-control-plane.rst
  create mode 100755 include/trace/events/hbf.h
  create mode 100644 include/uapi/linux/hbf.h

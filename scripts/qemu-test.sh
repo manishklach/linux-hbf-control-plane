@@ -3,20 +3,25 @@
 #
 # qemu-test.sh  —  Boot patched kernel in QEMU and run HBF tests
 #
+# Boots with a 2-node NUMA topology (256MB each).
 # Uses tests/qemu-test-init.c as the /init binary (statically linked).
 #
 # Prerequisites:
 #   - KERNEL_TREE points to a built kernel with CONFIG_HBF_CONTROL_PLANE=y
-#   - Cross/x86_64 gcc (x86_64-linux-gnu-gcc) for static compilation
+#   - x86_64-linux-gnu-gcc for static compilation
 #   - QEMU installed (qemu-system-x86_64)
 #
 # Usage:
 #   export KERNEL_TREE=/path/to/linux
+#   export HBF_QEMU_NODES=2          (optional, default 2)
+#   export HBF_QEMU_MEM_PER_NODE=256M (optional, default 256M)
 #   ./scripts/qemu-test.sh
 
 set -euo pipefail
 
 KERNEL_TREE="${KERNEL_TREE:-}"
+HBF_QEMU_NODES="${HBF_QEMU_NODES:-2}"
+HBF_QEMU_MEM_PER_NODE="${HBF_QEMU_MEM_PER_NODE:-256M}"
 
 if [ -z "$KERNEL_TREE" ]; then
 	echo "error: KERNEL_TREE must be set" >&2
@@ -43,6 +48,9 @@ fi
 # Build a minimal initrd with the standalone test binary as /init
 INITRD_DIR=$(mktemp -d)
 
+echo "=== HBF QEMU Test ==="
+echo "Nodes: $HBF_QEMU_NODES, Memory per node: $HBF_QEMU_MEM_PER_NODE"
+
 # Compile the test binary statically against kernel UAPI headers
 x86_64-linux-gnu-gcc -static \
 	-I"${KERNEL_TREE}/include/uapi" -I"${KERNEL_TREE}/include" \
@@ -51,13 +59,25 @@ x86_64-linux-gnu-gcc -static \
 # Create initrd cpio archive
 (cd "$INITRD_DIR" && find . | cpio -o -H newc | gzip > /tmp/hbf-test-initrd.gz)
 
+# Build NUMA topology QEMU arguments
+NUMACTL=""
+MEMOBJ=""
+for i in $(seq 0 $((HBF_QEMU_NODES - 1))); do
+	MEMOBJ="$MEMOBJ -object memory-backend-ram,size=$HBF_QEMU_MEM_PER_NODE,id=m$i"
+	NUMACTL="$NUMACTL -numa node,memdev=m$i,cpus=$i"
+done
+# Pin CPU 0 to node 0, CPU 1 to node 1, etc.
+SMTOPTS="-smp sockets=$HBF_QEMU_NODES,cores=1,threads=1"
+
 # Boot QEMU
 qemu-system-x86_64 \
+	$SMTOPTS \
+	$MEMOBJ \
+	$NUMACTL \
 	-kernel "$KERNEL" \
 	-initrd /tmp/hbf-test-initrd.gz \
 	-append "console=ttyS0 panic=1" \
 	-nographic \
-	-m 512M \
 	-nodefaults \
 	-serial mon:stdio
 

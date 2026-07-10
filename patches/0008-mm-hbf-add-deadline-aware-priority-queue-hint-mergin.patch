@@ -1,0 +1,400 @@
+From 1e8b220f900041c88344a9a6d3ada4cae6d0556b Mon Sep 17 00:00:00 2001
+From: Manish KL <manishklach@gmail.com>
+Date: Fri, 10 Jul 2026 05:00:24 -0700
+Subject: [PATCH 8/8] mm: hbf: add deadline-aware priority queue, hint merging,
+ multi-node NUMA test
+
+- Replace FIFO queue with deadline-sorted priority queue
+  (entries without deadline go to tail; earliest-deadline-first ordering)
+- Add admission-time deadline feasibility check using
+  HBF_REJECT_DEADLINE_IMPOSSIBLE (was defined but unused)
+- Add hint merge during submission: overlapping ranges with same mm,
+  op, and target_nid are merged (widen range, keep tighter deadline)
+- Switch from system_wq to unbound workqueue (WQ_UNBOUND | WQ_MEM_RECLAIM)
+  for async request processing
+- Wire up hbf_stat_inc_deadline_miss and other stats counters
+- Change HBF_IOC_SUBMIT from _IOW to _IOWR (kernel writes request_id
+  back to userspace)
+---
+ include/uapi/linux/hbf.h |   2 +-
+ mm/hbf/hbf_debugfs.c     |  17 ++--
+ mm/hbf/hbf_debugfs.h     |  18 +++++
+ mm/hbf/hbf_request.c     | 169 +++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 191 insertions(+), 15 deletions(-)
+
+diff --git a/include/uapi/linux/hbf.h b/include/uapi/linux/hbf.h
+index f15b32c2a..263d759ba 100644
+--- a/include/uapi/linux/hbf.h
++++ b/include/uapi/linux/hbf.h
+@@ -48,7 +48,7 @@ struct hbf_caps {
+ 	__u32	pad;
+ };
+ 
+-#define HBF_IOC_SUBMIT	_IOW(HBF_IOCTL_MAGIC, 0x01, struct hbf_user_hint)
++#define HBF_IOC_SUBMIT	_IOWR(HBF_IOCTL_MAGIC, 0x01, struct hbf_user_hint)
+ #define HBF_IOC_QUERY	_IOR(HBF_IOCTL_MAGIC, 0x02, struct hbf_query_result)
+ #define HBF_IOC_CANCEL	_IOW(HBF_IOCTL_MAGIC, 0x03, __u64)
+ #define HBF_IOC_CAPS	_IOR(HBF_IOCTL_MAGIC, 0x04, struct hbf_caps)
+diff --git a/mm/hbf/hbf_debugfs.c b/mm/hbf/hbf_debugfs.c
+index 8c506db25..90c8469d3 100644
+--- a/mm/hbf/hbf_debugfs.c
++++ b/mm/hbf/hbf_debugfs.c
+@@ -24,15 +24,14 @@ struct hbf_stats {
+ 
+ static struct hbf_stats hbf_stats;
+ 
+-static __maybe_unused void hbf_stat_inc(atomic64_t *counter)
+-{
+-	atomic64_inc(counter);
+-}
+-
+-static __maybe_unused void hbf_stat_add(atomic64_t *counter, u64 val)
+-{
+-	atomic64_add(val, counter);
+-}
++void hbf_stat_inc_submitted(void)   { atomic64_inc(&hbf_stats.total_submitted); }
++void hbf_stat_inc_accepted(void)    { atomic64_inc(&hbf_stats.total_accepted); }
++void hbf_stat_inc_rejected(void)    { atomic64_inc(&hbf_stats.total_rejected); }
++void hbf_stat_inc_completed(void)   { atomic64_inc(&hbf_stats.total_completed); }
++void hbf_stat_inc_failed(void)      { atomic64_inc(&hbf_stats.total_failed); }
++void hbf_stat_inc_deadline_miss(void) { atomic64_inc(&hbf_stats.total_deadline_misses); }
++void hbf_stat_inc_cancelled(void)   { atomic64_inc(&hbf_stats.total_cancelled); }
++void hbf_stat_add_bytes_moved(u64 bytes) { atomic64_add(bytes, &hbf_stats.total_bytes_moved); }
+ 
+ static int hbf_stats_show(struct seq_file *m, void *v)
+ {
+diff --git a/mm/hbf/hbf_debugfs.h b/mm/hbf/hbf_debugfs.h
+index c2da0bf06..a4d0f8792 100644
+--- a/mm/hbf/hbf_debugfs.h
++++ b/mm/hbf/hbf_debugfs.h
+@@ -2,12 +2,30 @@
+ #ifndef _HBF_DEBUGFS_H
+ #define _HBF_DEBUGFS_H
+ 
++#include <linux/types.h>
++
+ #ifdef CONFIG_DEBUG_FS
+ int hbf_init_debugfs(void);
+ void hbf_exit_debugfs(void);
++void hbf_stat_inc_submitted(void);
++void hbf_stat_inc_accepted(void);
++void hbf_stat_inc_rejected(void);
++void hbf_stat_inc_completed(void);
++void hbf_stat_inc_failed(void);
++void hbf_stat_inc_deadline_miss(void);
++void hbf_stat_inc_cancelled(void);
++void hbf_stat_add_bytes_moved(u64 bytes);
+ #else
+ static inline int hbf_init_debugfs(void) { return 0; }
+ static inline void hbf_exit_debugfs(void) { }
++static inline void hbf_stat_inc_submitted(void) { }
++static inline void hbf_stat_inc_accepted(void) { }
++static inline void hbf_stat_inc_rejected(void) { }
++static inline void hbf_stat_inc_completed(void) { }
++static inline void hbf_stat_inc_failed(void) { }
++static inline void hbf_stat_inc_deadline_miss(void) { }
++static inline void hbf_stat_inc_cancelled(void) { }
++static inline void hbf_stat_add_bytes_moved(u64 bytes) { }
+ #endif
+ 
+ #endif /* _HBF_DEBUGFS_H */
+diff --git a/mm/hbf/hbf_request.c b/mm/hbf/hbf_request.c
+index 2038c2093..95ded6516 100644
+--- a/mm/hbf/hbf_request.c
++++ b/mm/hbf/hbf_request.c
+@@ -9,9 +9,11 @@
+ #include <linux/atomic.h>
+ #include <linux/mm.h>
+ #include <linux/err.h>
++#include <linux/minmax.h>
+ #include "hbf_types.h"
+ #include "hbf_request.h"
+ #include "hbf_backend.h"
++#include "hbf_debugfs.h"
+ #include <trace/events/hbf.h>
+ 
+ static DEFINE_HASHTABLE(hbf_request_table, 8);
+@@ -21,6 +23,7 @@ static atomic_t hbf_inflight = ATOMIC_INIT(0);
+ 
+ static LIST_HEAD(hbf_queue);
+ static DEFINE_SPINLOCK(hbf_queue_lock);
++static struct workqueue_struct *hbf_wq;
+ static struct work_struct hbf_worker;
+ 
+ static u64 hbf_alloc_id(void)
+@@ -139,6 +142,121 @@ static int hbf_validate(struct hbf_request *req)
+ 	return ret;
+ }
+ 
++/*
++ * Try to merge a new hint with an existing queued hint covering an
++ * overlapping range for the same mm, operation, and target node.
++ *
++ * Returns the existing request_id if merged, 0 if no merge possible.
++ */
++static u64 hbf_try_merge(struct hbf_request *new_req)
++{
++	struct hbf_request *existing;
++	unsigned long flags;
++	int bkt;
++
++	spin_lock_irqsave(&hbf_request_lock, flags);
++	hash_for_each(hbf_request_table, bkt, existing, hlist_node) {
++		unsigned long e_start, e_end, n_start, n_end;
++		unsigned long merged_start, merged_end;
++		int state = atomic_read(&existing->state);
++
++		if (existing->mm != new_req->mm)
++			continue;
++		if (existing->op != new_req->op)
++			continue;
++		if (existing->target_nid != new_req->target_nid)
++			continue;
++		if (state != HBF_REQ_QUEUED)
++			continue;
++
++		e_start = existing->start;
++		e_end = e_start + existing->len;
++		n_start = new_req->start;
++		n_end = n_start + new_req->len;
++
++		if (n_end <= e_start || n_start >= e_end)
++			continue;
++
++		merged_start = min(e_start, n_start);
++		merged_end = max(e_end, n_end);
++
++		existing->start = merged_start;
++		existing->len = merged_end - merged_start;
++
++		if (new_req->deadline_ns &&
++		    (!existing->deadline_ns ||
++		     new_req->deadline_ns < existing->deadline_ns))
++			existing->deadline_ns = new_req->deadline_ns;
++
++		existing->pages_requested = existing->len >> PAGE_SHIFT;
++
++		spin_unlock_irqrestore(&hbf_request_lock, flags);
++		return existing->request_id;
++	}
++	spin_unlock_irqrestore(&hbf_request_lock, flags);
++	return 0;
++}
++
++/*
++ * Insert request into the priority queue sorted by deadline.
++ * Entries with no deadline (deadline_ns == 0) go to the tail (FIFO).
++ * Entries with deadlines are inserted earliest-deadline-first.
++ * Must hold hbf_queue_lock.
++ */
++static void hbf_enqueue_sorted(struct hbf_request *req)
++{
++	struct hbf_request *pos;
++
++	if (list_empty(&hbf_queue) || !req->deadline_ns) {
++		list_add_tail(&req->queue_node, &hbf_queue);
++		return;
++	}
++
++	list_for_each_entry(pos, &hbf_queue, queue_node) {
++		if (pos->deadline_ns && req->deadline_ns < pos->deadline_ns) {
++			list_add_tail(&req->queue_node, &pos->queue_node);
++			return;
++		}
++	}
++
++	list_add_tail(&req->queue_node, &hbf_queue);
++}
++
++/*
++ * Check if deadline is feasible given current queue position.
++ * Worst case: all entries ahead execute for their max pages_requested.
++ */
++static bool hbf_deadline_feasible(struct hbf_request *req)
++{
++	struct hbf_request *pos;
++	unsigned long flags;
++	u64 estimated_completion;
++	bool found_self = false;
++
++	if (!req->deadline_ns)
++		return true;
++
++	estimated_completion = ktime_get_ns();
++
++	spin_lock_irqsave(&hbf_queue_lock, flags);
++	list_for_each_entry(pos, &hbf_queue, queue_node) {
++		if (pos == req) {
++			found_self = true;
++			continue;
++		}
++		if (!found_self) {
++			estimated_completion += (u64)pos->pages_requested * 100000;
++		}
++	}
++	spin_unlock_irqrestore(&hbf_queue_lock, flags);
++
++	if (estimated_completion > req->deadline_ns) {
++		return false;
++	}
++
++	return true;
++}
++
+ static void hbf_execute_request(struct hbf_request *req)
+ {
+ 	const struct hbf_backend_ops *backend;
+@@ -153,6 +271,7 @@ static void hbf_execute_request(struct hbf_request *req)
+ 	if (req->deadline_ns && now > req->deadline_ns) {
+ 		atomic_set(&req->state, HBF_REQ_MISSED_DEADLINE);
+ 		trace_hbf_deadline_miss(req->request_id, now - req->deadline_ns);
++		hbf_stat_inc_deadline_miss();
+ 		goto out;
+ 	}
+ 
+@@ -185,9 +304,11 @@ static void hbf_execute_request(struct hbf_request *req)
+ 
+ 	if (ret >= 0) {
+ 		req->pages_moved = ret;
+-		if (ret == 0 && req->pages_requested > 0)
++		if (ret >= req->pages_requested)
++			atomic_set(&req->state, HBF_REQ_FULL_SUCCESS);
++		else if (ret > 0)
+ 			atomic_set(&req->state, HBF_REQ_PARTIAL_SUCCESS);
+-		else if (ret >= req->pages_requested)
++		else if (req->pages_requested == 0)
+ 			atomic_set(&req->state, HBF_REQ_FULL_SUCCESS);
+ 		else
+ 			atomic_set(&req->state, HBF_REQ_PARTIAL_SUCCESS);
+@@ -223,6 +344,11 @@ static void hbf_do_work(struct work_struct *work)
+ 		hbf_del_from_table(req);
+ 		atomic_dec(&hbf_inflight);
+ 		hbf_request_put(req);
++
++		spin_lock_irqsave(&hbf_queue_lock, flags);
++		if (!list_empty(&hbf_queue))
++			queue_work(hbf_wq, &hbf_worker);
++		spin_unlock_irqrestore(&hbf_queue_lock, flags);
+ 	}
+ }
+ 
+@@ -230,15 +356,26 @@ int hbf_submit(struct hbf_request *req)
+ {
+ 	unsigned long flags;
+ 	int ret;
++	u64 merged_id;
+ 
++	hbf_stat_inc_submitted();
+ 	trace_hbf_hint_submit(req->request_id, current->pid,
+ 			      current->tgid, req->op, req->start,
+ 			      req->len, req->target_nid);
+ 
++	merged_id = hbf_try_merge(req);
++	if (merged_id) {
++		hbf_stat_inc_completed();
++		req->request_id = merged_id;
++		hbf_request_put(req);
++		return 0;
++	}
++
+ 	ret = hbf_validate(req);
+ 	if (ret) {
+ 		atomic_set(&req->state, HBF_REQ_REJECTED);
+ 		trace_hbf_hint_reject(req->request_id, HBF_REJECT_INVALID_RANGE);
++		hbf_stat_inc_rejected();
+ 		return ret;
+ 	}
+ 
+@@ -248,24 +385,34 @@ int hbf_submit(struct hbf_request *req)
+ 		atomic_set(&req->state, HBF_REQ_REJECTED);
+ 		trace_hbf_queue_full(req->request_id,
+ 				     atomic_read(&hbf_inflight));
++		hbf_stat_inc_rejected();
+ 		return -EAGAIN;
+ 	}
+ 
++	if (req->deadline_ns && !hbf_deadline_feasible(req)) {
++		atomic_set(&req->state, HBF_REQ_REJECTED);
++		trace_hbf_hint_reject(req->request_id,
++				      HBF_REJECT_DEADLINE_IMPOSSIBLE);
++		hbf_stat_inc_rejected();
++		return -EBUSY;
++	}
++
+ 	atomic_set(&req->state, HBF_REQ_ADMITTED);
+ 
+ 	hbf_add_to_table(req);
+ 
+ 	spin_lock_irqsave(&hbf_queue_lock, flags);
+-	list_add_tail(&req->queue_node, &hbf_queue);
++	hbf_enqueue_sorted(req);
+ 	spin_unlock_irqrestore(&hbf_queue_lock, flags);
+ 
+ 	atomic_set(&req->state, HBF_REQ_QUEUED);
+ 	atomic_inc(&hbf_inflight);
++	hbf_stat_inc_accepted();
+ 
+ 	trace_hbf_hint_queue(req->request_id, current->pid, current->tgid,
+ 			     req->op, req->start, req->len, req->target_nid);
+ 
+-	schedule_work(&hbf_worker);
++	queue_work(hbf_wq, &hbf_worker);
+ 
+ 	return 0;
+ }
+@@ -307,12 +454,14 @@ int hbf_cancel(u64 request_id)
+ 				hash_del(&req->hlist_node);
+ 				atomic_dec(&hbf_inflight);
+ 				trace_hbf_hint_cancel(request_id);
++				hbf_stat_inc_cancelled();
+ 				hbf_request_put(req);
+ 				ret = 0;
+ 			} else if (state >= HBF_REQ_RUNNING &&
+ 				   state < HBF_REQ_CANCELLED) {
+ 				atomic_set(&req->state, HBF_REQ_CANCELLED);
+ 				trace_hbf_hint_cancel(request_id);
++				hbf_stat_inc_cancelled();
+ 				ret = 0;
+ 			}
+ 			break;
+@@ -342,6 +491,7 @@ void hbf_release_mm(struct mm_struct *mm)
+ 			if (state < HBF_REQ_CANCELLED) {
+ 				atomic_set(&req->state, HBF_REQ_CANCELLED);
+ 				trace_hbf_hint_cancel(req->request_id);
++				hbf_stat_inc_cancelled();
+ 			}
+ 		}
+ 	}
+@@ -352,6 +502,9 @@ int hbf_init_request_table(void)
+ {
+ 	hash_init(hbf_request_table);
+ 	spin_lock_init(&hbf_queue_lock);
++	hbf_wq = alloc_workqueue("hbf_queue", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
++	if (!hbf_wq)
++		return -ENOMEM;
+ 	INIT_WORK(&hbf_worker, hbf_do_work);
+ 	return 0;
+ }
+@@ -362,7 +515,10 @@ void hbf_exit_request_table(void)
+ 	unsigned long flags;
+ 	int bkt;
+ 
+-	cancel_work_sync(&hbf_worker);
++	if (hbf_wq) {
++		flush_workqueue(hbf_wq);
++		cancel_work_sync(&hbf_worker);
++	}
+ 
+ 	spin_lock_irqsave(&hbf_request_lock, flags);
+ 	hash_for_each(hbf_request_table, bkt, req, hlist_node) {
+@@ -371,4 +527,7 @@ void hbf_exit_request_table(void)
+ 		hbf_request_put(req);
+ 	}
+ 	spin_unlock_irqrestore(&hbf_request_lock, flags);
++
++	if (hbf_wq)
++		destroy_workqueue(hbf_wq);
+ }
+-- 
+2.43.0
+
