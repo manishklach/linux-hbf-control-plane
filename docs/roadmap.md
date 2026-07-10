@@ -1,37 +1,37 @@
 # Roadmap
 
-## v0
+## v0 — Foundation (*shipped*)
 
-- documentation set
+- Documentation set
 - UAPI sketch
-- char device skeleton
+- Char device skeleton
 
-## v1
+## v1 — Observability (*shipped*)
 
-- tracepoints
-- per-op statistics
-- basic observability for accepted, rejected, and deferred hints
+- Tracepoints (11 events in `include/trace/events/hbf.h`)
+- DebugFS interface (`/sys/kernel/debug/hbf/`)
+- Per-request statistics
 
-## v2
+## v2 — NUMA Tier Backend (*shipped as v0.2*)
 
-- DAX/CXL backend prototype
-- early placement translation into migration or staging work
-- backend capability reporting
+- Request lifecycle with async queue (system_unbound_wq)
+- 4 ioctls via /dev/hbfctl (SUBMIT, QUERY, CANCEL, CAPS)
+- Folio-based NUMA page migration
+- Userspace hbfctl CLI tool and bpftrace scripts
+- QEMU boot-verified
 
-## v3
+## v3 — Multi-node & Hint Scheduling
 
-- runtime integration with `vLLM` and `llama.cpp`-style KV-cache traces
-- trace replay harnesses
-- policy experiments around deadlines and user tags
+- Multi-node NUMA testing (QEMU with -numa topology, real HW)
+- Hint merge logic for overlapping ranges
+- Deadline-aware priority queue
+- Anti-thrashing hysteresis
+- Expanded test suite for concurrent submit/cancel
 
-## v4
+## v4 — CXL/DAX Backend & Runtime Integration
 
-- cgroup accounting
-- policy controls and admission limits
-- multi-tenant fairness and isolation review
-
-## v5
-
-- LKML submission refinement
-- interface simplification based on review
-- decision on long-term subsystem fit
+- Pluggable backend framework
+- CXL type-2 device migration path
+- Runtime integration with `vLLM` and `llama.cpp`-style KV-cache traces
+- Trace replay harnesses
+- Policy experiments around deadlines and user tags
