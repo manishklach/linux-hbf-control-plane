@@ -3,20 +3,20 @@
 #
 # qemu-test.sh  —  Boot patched kernel in QEMU and run HBF tests
 #
+# Uses tests/qemu-test-init.c as the /init binary (statically linked).
+#
 # Prerequisites:
 #   - KERNEL_TREE points to a built kernel with CONFIG_HBF_CONTROL_PLANE=y
-#   - Busybox rootfs image at \$ROOTFS_IMAGE
+#   - Cross/x86_64 gcc (x86_64-linux-gnu-gcc) for static compilation
 #   - QEMU installed (qemu-system-x86_64)
 #
 # Usage:
 #   export KERNEL_TREE=/path/to/linux
-#   export ROOTFS_IMAGE=/path/to/rootfs.ext4
 #   ./scripts/qemu-test.sh
 
 set -euo pipefail
 
 KERNEL_TREE="${KERNEL_TREE:-}"
-ROOTFS="${ROOTFS_IMAGE:-}"
 
 if [ -z "$KERNEL_TREE" ]; then
 	echo "error: KERNEL_TREE must be set" >&2
@@ -31,35 +31,22 @@ if [ ! -f "$KERNEL" ]; then
 	exit 1
 fi
 
-# Build a minimal initrd with hbfctl and test binaries
-INITRD_DIR=$(mktemp -d)
-cp "$KERNEL_TREE/samples/hbf/hbfctl" "$INITRD_DIR/"
-cp "$KERNEL_TREE/tools/testing/selftests/mm/hbf_hint_abi" "$INITRD_DIR/"
-cp "$KERNEL_TREE/tools/testing/selftests/mm/hbf_promote_demote" "$INITRD_DIR/"
+# Locate the test source (relative to this script or explicit)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TEST_SRC="${TEST_SRC:-${SCRIPT_DIR}/../tests/qemu-test-init.c}"
 
-cat > "$INITRD_DIR/init" << 'INITEOF'
-#!/bin/sh
-mount -t proc none /proc
-mount -t sysfs none /sys
-mount -t debugfs none /sys/kernel/debug
-
-echo "=== HBF Control Plane QEMU Test ==="
-
-# Check device exists
-if [ -c /dev/hbfctl ]; then
-	echo "OK: /dev/hbfctl present"
-else
-	echo "FAIL: /dev/hbfctl not found"
+if [ ! -f "$TEST_SRC" ]; then
+	echo "error: test source not found at $TEST_SRC" >&2
+	exit 1
 fi
 
-# Run tests
-/hbf_hint_abi 2>&1
-echo "exit: $?"
+# Build a minimal initrd with the standalone test binary as /init
+INITRD_DIR=$(mktemp -d)
 
-# Power off
-poweroff -f
-INITEOF
-chmod +x "$INITRD_DIR/init"
+# Compile the test binary statically against kernel UAPI headers
+x86_64-linux-gnu-gcc -static \
+	-I"${KERNEL_TREE}/include/uapi" -I"${KERNEL_TREE}/include" \
+	"$TEST_SRC" -o "${INITRD_DIR}/init"
 
 # Create initrd cpio archive
 (cd "$INITRD_DIR" && find . | cpio -o -H newc | gzip > /tmp/hbf-test-initrd.gz)
@@ -70,8 +57,7 @@ qemu-system-x86_64 \
 	-initrd /tmp/hbf-test-initrd.gz \
 	-append "console=ttyS0 panic=1" \
 	-nographic \
-	-m 2G \
-	-smp 2 \
+	-m 512M \
 	-nodefaults \
 	-serial mon:stdio
 
