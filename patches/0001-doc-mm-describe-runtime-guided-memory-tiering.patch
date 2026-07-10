@@ -1,0 +1,256 @@
+From a708e21dfde66b861d939085a64a49a70bb3147c Mon Sep 17 00:00:00 2001
+From: Manish KL <manishklach@gmail.com>
+Date: Fri, 10 Jul 2026 00:47:38 -0700
+Subject: [PATCH 1/7] doc: mm: describe runtime-guided memory tiering
+
+Add documentation for the Heterogeneous Memory Control Plane, covering:
+- Memory tier model (hot/warm/cold)
+- Hint operations (prefetch, promote, demote, release)
+- Hint lifecycle state machine
+- Backend abstraction
+- Design rationale for internal types, async execution, and ioctl frontend
+- Tracepoints and debugfs observability
+
+Signed-off-by: Manish KL <manishklach@gmail.com>
+---
+ Documentation/mm/hbf-control-plane.rst | 228 +++++++++++++++++++++++++
+ 1 file changed, 228 insertions(+)
+ create mode 100644 Documentation/mm/hbf-control-plane.rst
+
+diff --git a/Documentation/mm/hbf-control-plane.rst b/Documentation/mm/hbf-control-plane.rst
+new file mode 100644
+index 000000000..2bab0daa5
+--- /dev/null
++++ b/Documentation/mm/hbf-control-plane.rst
+@@ -0,0 +1,228 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++=============================
++HBF Control Plane — Memory Tier Hint API
++=============================
++
++:Author: Manish KL
++:Created: 2025
++:Status: Experimental — RFC quality, not upstream
++
++Overview
++========
++
++The Heterogeneous memory control plane provides a kernel interface for AI
++inference runtimes to communicate future memory-access intent.  A runtime
++predicts which memory ranges a model will access (e.g., KV-cache blocks,
++attention tensors, embedding tables) and issues hints to the kernel so that
++pages can be placed in the appropriate memory tier before demand access.
++
++The system treats three tiers:
++
++- **Hot tier** — fast, small, near-compute (HBM, local DRAM node 0)
++- **Warm tier** — high capacity, higher latency (CXL-attached memory,
++  HBF-like flash, NUMA node 1)
++- **Cold tier** — storage (NVMe, SSD, object store; not yet controlled
++  by this API)
++
++The kernel is the orchestrator: it validates hints, queues them, selects a
++backend (NUMA migration, CXL copy, DAX kmem management), executes the
++movement asynchronously, and reports completion.
++
++Guiding principles
++==================
++
++1. **Advisory only** — hints are performance signals, never correctness
++   critical.  Ignoring, delaying, or partially executing a hint must not
++   cause application data loss or semantic error.
++
++2. **Runtime knows the future schedule** — the kernel does not predict.
++   The runtime knows which sequences are about to decode, which KV blocks
++   will be reused, and when.  The kernel executes.
++
++3. **Observability first** — every hint lifecycle event is visible via
++   tracepoints before any advanced policy is built.
++
++4. **Transport neutral** — the ioctl character device is a prototyping
++   frontend.  The core logic operates on an internal ``struct
++   mm_tier_range_hint`` and can be reached through ``madvise()``, a
++   shared-memory ring, or any future mechanism without rewriting the
++   backends.
++
++5. **No block layer** — warm memory in this design is byte-addressable
++   (or migration-managed) capacity, not a block device.  ``blk-mq``, file
++   systems, and ``struct request`` are not involved.
++
++Hint operations
++===============
++
++.. code-block:: c
++
++    enum mm_tier_hint_op {
++        MM_TIER_HINT_PREFETCH  = 1,
++        MM_TIER_HINT_PROMOTE   = 2,
++        MM_TIER_HINT_DEMOTE    = 3,
++        MM_TIER_HINT_RELEASE   = 4,
++    };
++
++``PREFETCH``
++    Make pages resident and optionally move them toward a preferred NUMA
++    node before demand access.  Evaluated strategies include
++    ``get_user_pages_fast()`` + ``migrate_pages()``,
++    ``faultin_vma_page_range()``, and ``MADV_WILLNEED``.
++
++``PROMOTE``
++    Move eligible pages from the warm tier to the hot tier (e.g., from
++    NUMA node 1 to node 0).
++
++``DEMOTE``
++    Move cold pages from the hot tier to the warm tier to free capacity.
++
++``RELEASE``
++    Cancel queued intent and allow normal reclaim or automatic tiering
++    to manage the range.  Does not discard application data.
++
++Hint lifecycle
++==============
++
++Every hint passes through these states::
++
++    SUBMITTED
++       |
++       v
++    VALIDATED ----→ REJECTED
++       |
++       v
++    ADMITTED
++       |
++       v
++    QUEUED
++       |
++       v
++    RUNNING
++       |
++       v
++    COMPLETED  (one of: FULL_SUCCESS, PARTIAL_SUCCESS,
++                          MISSED_DEADLINE, CANCELLED, BACKEND_FAILURE)
++
++The ``SUBMIT`` ioctl returns a ``request_id`` synchronously; the caller
++polls ``QUERY`` or waits for a tracepoint event to learn the outcome.
++
++Backend abstraction
++===================
++
++Backends implement ``struct hbf_backend_ops``:
++
++.. code-block:: c
++
++    struct hbf_backend_ops {
++        int (*query_range)(struct mm_struct *mm, unsigned long start,
++                           unsigned long len, int *src_nid);
++        int (*prefetch_range)(struct mm_struct *mm, unsigned long start,
++                              unsigned long len, int target_nid);
++        int (*promote_range)(struct mm_struct *mm, unsigned long start,
++                             unsigned long len, int target_nid);
++        int (*demote_range)(struct mm_struct *mm, unsigned long start,
++                            unsigned long len, int target_nid);
++        int (*release_range)(struct mm_struct *mm, unsigned long start,
++                             unsigned long len);
++        bool (*supports_target)(int nid);
++    };
++
++The NUMA backend (``hbf_numa``) is registered by default.  Future
++backends for CXL, DAX/kmem, or fabric-attached memory can be added by
++calling ``hbf_register_backend()``.
++
++Design decisions
++================
++
++**Why an internal struct first?**
++    The core implementation operates on ``struct mm_tier_range_hint`` so
++    that the ioctl ``/dev/hbfctl`` is a thin replaceable adapter.  This
++    protects against premature ABI commitment.
++
++**Why not ``madvise()`` for v1?**
++    ``madvise()`` is synchronous and per-VMA.  The hint model requires
++    asynchronous completion, multi-VMA ranges, deadline scheduling, and
++    per-request observability.  A future ``MADV_TIER_*`` extension is
++    possible once the internal machinery is proven.
++
++**Why asynchronous?**
++    Prefetch and migration take milliseconds for typical ranges.  Blocking
++    the submitter would defeat the purpose of advance hinting.
++
++Tracepoints
++===========
++
++Defined in ``mm/hbf/hbf_tracepoints.h``:
++
++====  ============================
++Event  Purpose
++====  ============================
++``hbf_hint_submit``       Hint received from userspace
++``hbf_hint_validate``     Range and permission check result
++``hbf_hint_reject``       Hint rejected (reason code)
++``hbf_hint_queue``        Hint enqueued for async execution
++``hbf_hint_start``        Backend execution begins
++``hbf_page_move``         Single page migrated between nodes
++``hbf_hint_complete``     Hint finished (full, partial, failed)
++``hbf_hint_cancel``       Hint cancelled by userspace or exit
++``hbf_demand_touch``      Page touched before hint completed
++``hbf_deadline_miss``     Execution finished after deadline
++``hbf_queue_full``        Hint rejected due to queue capacity
++====  ============================
++
++Usage::
++
++    perf list | grep hbf
++    perf trace -e hbf:hbf_hint_submit,hbf:hbf_hint_complete
++
++Debug interface
++===============
++
++``/sys/kernel/debug/hbf/`` provides:
++
++``stats``
++    Total hints, accepted, rejected, completed, failed, bytes moved.
++``requests``
++    Human-readable table of in-flight requests.
++``backends``
++    Registered backends and their capabilities.
++``failures``
++    Ring buffer of recent failures (1024 entries).
++``latency_histogram``
++    Submission-to-start and start-to-complete latency buckets.
++
++Process isolation
++=================
++
++- A hint applies only to the caller's own address space.
++- ``mm_struct`` is pinned with ``mmgrab()`` for asynchronous work.
++- Hints are cancelled on ``exec``, ``exit``, and ``munmap`` of the
++  hinted range.
++- Validation runs at submission time and again before execution to
++  detect concurrent modification.
++
++Security
++========
++
++- ``/dev/hbfctl`` is mode ``0600``, root-only by default.
++- No kernel address or cross-process information is exposed.
++
++Future work
++===========
++
++- CXL Type-3 memory expander backend
++- DAX/kmem backend for persistent memory
++- ``madvise()``-based hint variants
++- Shared-memory submission ring for high-frequency runtimes
++- Cgroup controller for per-tenant budgets
++- Admission control with cost-benefit scoring
++- Anti-thrashing hysteresis
++
++References
++==========
++
++- Linux mm documentation: ``Documentation/admin-guagement/numa_memory_policy.rst``
++- Linux CXL documentation: ``Documentation/driver-api/cxl/index.rst``
++- Linux memory-tiers documentation: ``Documentation/admin-guide/memory-tiers.rst``
+-- 
+2.43.0
+

@@ -16,9 +16,12 @@ Thumbs.db
 *.elf
 *.out
 
-# Userspace examples
-/examples/hbfctl-demo
-/examples/*.o
+# Benchmarks
+/benchmarks/sequential-access
+/benchmarks/random-access
+/benchmarks/promote-pressure
+/benchmarks/memory-pressure
+/benchmarks/*.o
 
 # Logs and temp files
 *.log

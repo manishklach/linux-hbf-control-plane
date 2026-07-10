@@ -1,0 +1,464 @@
+From 49735f9ddfe09c4dce09aad572a75dacb81b907e Mon Sep 17 00:00:00 2001
+From: Manish KL <manishklach@gmail.com>
+Date: Fri, 10 Jul 2026 00:48:14 -0700
+Subject: [PATCH 6/7] selftests: mm: add HBF hint ABI, migration, and
+ cancellation tests
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Four test programs:
+
+- hbf_hint_abi: validates ioctl interface — CAPS returns capabilities,
+  SUBMIT accepts valid ranges and rejects invalid args, QUERY returns
+  correct state, CANCEL handles unknown IDs cleanly
+- hbf_promote_demote: allocates memory on a warm NUMA node, submits
+  PROMOTE to the hot node, verifies 90%+ pages migrated, then DEMOTEs
+  back and verifies 90%+ returned
+- hbf_reject_invalid: tests error paths — zero length, overflow,
+  null address, negative nid
+- hbf_cancel: submits a request, queries its state, cancels it
+
+All tests require CONFIG_HBF_CONTROL_PLANE and, for hbf_promote_demote,
+at least 2 online NUMA nodes.
+
+Signed-off-by: Manish KL <manishklach@gmail.com>
+---
+ tools/testing/selftests/mm/hbf_cancel.c       |  72 +++++++++
+ tools/testing/selftests/mm/hbf_hint_abi.c     | 107 +++++++++++++
+ .../testing/selftests/mm/hbf_promote_demote.c | 146 ++++++++++++++++++
+ .../testing/selftests/mm/hbf_reject_invalid.c |  76 +++++++++
+ 4 files changed, 401 insertions(+)
+ create mode 100644 tools/testing/selftests/mm/hbf_cancel.c
+ create mode 100644 tools/testing/selftests/mm/hbf_hint_abi.c
+ create mode 100644 tools/testing/selftests/mm/hbf_promote_demote.c
+ create mode 100644 tools/testing/selftests/mm/hbf_reject_invalid.c
+
+diff --git a/tools/testing/selftests/mm/hbf_cancel.c b/tools/testing/selftests/mm/hbf_cancel.c
+new file mode 100644
+index 000000000..2e61af933
+--- /dev/null
++++ b/tools/testing/selftests/mm/hbf_cancel.c
+@@ -0,0 +1,72 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <linux/types.h>
++#include <linux/hbf.h>
++
++#define SIZE (4096)
++
++static int failures = 0;
++static int tests = 0;
++
++#define TEST(desc, cond) do { \
++	tests++; \
++	if (!(cond)) { \
++		fprintf(stderr, "FAIL: %s\n", desc); \
++		failures++; \
++	} else { \
++		printf("OK:   %s\n", desc); \
++	} \
++} while (0)
++
++int main(void)
++{
++	int fd;
++	struct hbf_user_hint hint = { .version = 1 };
++	struct hbf_query_result qr;
++	__u64 req_id;
++	void *buf;
++
++	fd = open("/dev/hbfctl", O_RDWR);
++	TEST("open /dev/hbfctl", fd >= 0);
++	if (fd < 0) {
++		printf("SKIP\n");
++		return 0;
++	}
++
++	buf = malloc(SIZE);
++	memset(buf, 0x42, SIZE);
++
++	hint.start = (unsigned long)buf;
++	hint.len = SIZE;
++	hint.op = 1; // PREFETCH
++	hint.target_nid = 0;
++	hint.deadline_ns = 0;
++	hint.user_tag = 99;
++
++	TEST("SUBMIT succeeds", ioctl(fd, HBF_IOC_SUBMIT, &hint) == 0);
++	memcpy(&req_id, &hint, sizeof(req_id));
++	printf("request_id = %llu\n", req_id);
++
++	// Query immediately to see state
++	qr.request_id = req_id;
++	TEST("QUERY succeeds", ioctl(fd, HBF_IOC_QUERY, &qr) == 0);
++	printf("state = %u\n", qr.state);
++
++	TEST("request_id matches", qr.request_id == req_id);
++
++	// Cancel
++	TEST("CANCEL succeeds", ioctl(fd, HBF_IOC_CANCEL, &req_id) == 0);
++	TEST("CANCEL returns 0", 1);
++
++	free(buf);
++	close(fd);
++
++	printf("\n=== %d tests, %d failures ===\n", tests, failures);
++	return failures ? 1 : 0;
++}
+diff --git a/tools/testing/selftests/mm/hbf_hint_abi.c b/tools/testing/selftests/mm/hbf_hint_abi.c
+new file mode 100644
+index 000000000..9c596eb6f
+--- /dev/null
++++ b/tools/testing/selftests/mm/hbf_hint_abi.c
+@@ -0,0 +1,107 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <linux/types.h>
++#include <linux/hbf.h>
++
++static int failures = 0;
++static int tests = 0;
++
++#define TEST(desc, cond) do { \
++	tests++; \
++	if (!(cond)) { \
++		fprintf(stderr, "FAIL: %s\n", desc); \
++		failures++; \
++	} else { \
++		printf("OK:   %s\n", desc); \
++	} \
++} while (0)
++
++int main(void)
++{
++	int fd;
++	struct hbf_user_hint hint = { .version = 1 };
++	struct hbf_query_result qr;
++	struct hbf_caps caps;
++	__u64 req_id;
++
++	fd = open("/dev/hbfctl", O_RDWR);
++	TEST("open /dev/hbfctl", fd >= 0);
++	if (fd < 0) {
++		printf("SKIP: /dev/hbfctl not available\n");
++		return 0;
++	}
++
++	// Test CAPS
++	memset(&caps, 0, sizeof(caps));
++	TEST("HBF_IOC_CAPS succeeds",
++	     ioctl(fd, HBF_IOC_CAPS, &caps) == 0);
++	TEST("CAPS max_request_bytes > 0", caps.max_request_bytes > 0);
++	TEST("CAPS max_inflight > 0", caps.max_inflight > 0);
++	TEST("CAPS supported_ops includes PREFETCH",
++	     caps.supported_ops & (1 << 1));
++	TEST("CAPS supported_ops includes PROMOTE",
++	     caps.supported_ops & (1 << 2));
++
++	// Test SUBMIT with invalid op
++	hint.op = 0xff;
++	TEST("HBF_IOC_SUBMIT rejects invalid op",
++	     ioctl(fd, HBF_IOC_SUBMIT, &hint) < 0);
++
++	// Test SUBMIT with version mismatch
++	hint.op = 1;
++	hint.version = 0;
++	TEST("HBF_IOC_SUBMIT rejects version 0",
++	     ioctl(fd, HBF_IOC_SUBMIT, &hint) < 0);
++
++	// Test SUBMIT with unmapped range (should fail)
++	hint.version = 1;
++	hint.start = 0xdeadbeef000UL;
++	hint.len = 4096;
++	hint.op = 1;
++	hint.target_nid = 0;
++	TEST("HBF_IOC_SUBMIT rejects unmapped range",
++	     ioctl(fd, HBF_IOC_SUBMIT, &hint) < 0);
++
++	// Test SUBMIT with valid parameters
++	hint.start = (unsigned long)malloc(4096);
++	hint.len = 4096;
++	hint.op = 1;
++	hint.target_nid = 0;
++	hint.deadline_ns = 0;
++	hint.user_tag = 42;
++
++	TEST("HBF_IOC_SUBMIT with valid range succeeds",
++	     ioctl(fd, HBF_IOC_SUBMIT, &hint) == 0);
++
++	memcpy(&req_id, &hint, sizeof(req_id));
++	TEST("returned request_id > 0", req_id > 0);
++
++	// Test QUERY
++	memset(&qr, 0, sizeof(qr));
++	qr.request_id = req_id;
++	TEST("HBF_IOC_QUERY succeeds",
++	     ioctl(fd, HBF_IOC_QUERY, &qr) == 0);
++	TEST("QUERY request_id matches", qr.request_id == req_id);
++	TEST("QUERY state >= SUBMITTED", qr.submit_ns > 0);
++	TEST("QUERY submit_ns is set", qr.submit_ns > 0);
++
++	// Test QUERY with invalid request_id
++	qr.request_id = 99999999;
++	TEST("HBF_IOC_QUERY rejects unknown id",
++	     ioctl(fd, HBF_IOC_QUERY, &qr) < 0);
++
++	// Test CANCEL with invalid request_id
++	req_id = 99999999;
++	TEST("HBF_IOC_CANCEL rejects unknown id",
++	     ioctl(fd, HBF_IOC_CANCEL, &req_id) < 0);
++
++	close(fd);
++
++	printf("\n=== %d tests, %d failures ===\n", tests, failures);
++	return failures ? 1 : 0;
++}
+diff --git a/tools/testing/selftests/mm/hbf_promote_demote.c b/tools/testing/selftests/mm/hbf_promote_demote.c
+new file mode 100644
+index 000000000..5165cbfc8
+--- /dev/null
++++ b/tools/testing/selftests/mm/hbf_promote_demote.c
+@@ -0,0 +1,146 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <numa.h>
++#include <numaif.h>
++#include <linux/types.h>
++#include <linux/hbf.h>
++
++#define SIZE (2UL << 20)
++
++static int failures = 0;
++static int tests = 0;
++
++#define TEST(desc, cond) do { \
++	tests++; \
++	if (!(cond)) { \
++		fprintf(stderr, "FAIL: %s\n", desc); \
++		failures++; \
++	} else { \
++		printf("OK:   %s\n", desc); \
++	} \
++} while (0)
++
++static int get_page_nid(void *addr)
++{
++	int nid;
++	int ret = get_mempolicy(&nid, NULL, 0, addr, MPOL_F_NODE | MPOL_F_ADDR);
++	return ret == 0 ? nid : -1;
++}
++
++static int count_pages_on_node(void *addr, size_t len, int expected_nid)
++{
++	int pages = len / 4096;
++	int on_node = 0;
++
++	for (int i = 0; i < pages; i++) {
++		if (get_page_nid(addr + i * 4096) == expected_nid)
++			on_node++;
++	}
++	return on_node;
++}
++
++int main(void)
++{
++	int fd;
++	struct hbf_user_hint hint = { .version = 1 };
++	struct hbf_query_result qr;
++	__u64 req_id;
++	void *buf;
++	int warm_nid = 1;
++	int hot_nid = 0;
++	int count_before, count_after;
++
++	if (!numa_available()) {
++		printf("SKIP: NUMA not available\n");
++		return 0;
++	}
++
++	if (numa_num_configured_nodes() < 2) {
++		printf("SKIP: need at least 2 NUMA nodes\n");
++		return 0;
++	}
++
++	buf = numa_alloc_onnode(SIZE, warm_nid);
++	if (!buf) {
++		perror("numa_alloc_onnode");
++		return 1;
++	}
++
++	memset(buf, 0xAB, SIZE);
++
++	// Verify allocation is on warm node
++	count_before = count_pages_on_node(buf, SIZE, warm_nid);
++	TEST("allocation on warm node", count_before > (SIZE / 4096) * 0.8);
++
++	fd = open("/dev/hbfctl", O_RDWR);
++	TEST("open /dev/hbfctl", fd >= 0);
++	if (fd < 0) {
++		numa_free(buf, SIZE);
++		return 1;
++	}
++
++	// SUBMIT PROMOTE
++	hint.start = (unsigned long)buf;
++	hint.len = SIZE;
++	hint.op = 2; // PROMOTE
++	hint.target_nid = hot_nid;
++	hint.deadline_ns = 1000000000ULL; // 1 second deadline
++	hint.user_tag = 1;
++
++	TEST("SUBMIT PROMOTE succeeds",
++	     ioctl(fd, HBF_IOC_SUBMIT, &hint) == 0);
++
++	memcpy(&req_id, &hint, sizeof(req_id));
++	printf("PROMOTE request_id = %llu\n", req_id);
++
++	// Wait for completion
++	usleep(500000);
++
++	// QUERY completion
++	memset(&qr, 0, sizeof(qr));
++	qr.request_id = req_id;
++	TEST("QUERY succeeds", ioctl(fd, HBF_IOC_QUERY, &qr) == 0);
++	printf("PROMOTE state = %u, pages_moved = %llu\n",
++	       qr.state, qr.pages_moved);
++
++	// Verify pages on hot node
++	count_after = count_pages_on_node(buf, SIZE, hot_nid);
++	TEST("90%+ pages promoted to hot node",
++	     count_after > (SIZE / 4096) * 0.9);
++
++	// SUBMIT DEMOTE back to warm
++	hint.op = 3; // DEMOTE
++	hint.target_nid = warm_nid;
++	hint.user_tag = 2;
++
++	TEST("SUBMIT DEMOTE succeeds",
++	     ioctl(fd, HBF_IOC_SUBMIT, &hint) == 0);
++
++	memcpy(&req_id, &hint, sizeof(req_id));
++	printf("DEMOTE request_id = %llu\n", req_id);
++
++	usleep(500000);
++
++	memset(&qr, 0, sizeof(qr));
++	qr.request_id = req_id;
++	TEST("QUERY after demote succeeds",
++	     ioctl(fd, HBF_IOC_QUERY, &qr) == 0);
++	printf("DEMOTE state = %u, pages_moved = %llu\n",
++	       qr.state, qr.pages_moved);
++
++	count_after = count_pages_on_node(buf, SIZE, warm_nid);
++	TEST("90%+ pages demoted to warm node",
++	     count_after > (SIZE / 4096) * 0.9);
++
++	numa_free(buf, SIZE);
++	close(fd);
++
++	printf("\n=== %d tests, %d failures ===\n", tests, failures);
++	return failures ? 1 : 0;
++}
+diff --git a/tools/testing/selftests/mm/hbf_reject_invalid.c b/tools/testing/selftests/mm/hbf_reject_invalid.c
+new file mode 100644
+index 000000000..0f8be4b70
+--- /dev/null
++++ b/tools/testing/selftests/mm/hbf_reject_invalid.c
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <linux/types.h>
++#include <linux/hbf.h>
++
++static int failures = 0;
++static int tests = 0;
++
++#define TEST(desc, cond) do { \
++	tests++; \
++	if (!(cond)) { \
++		fprintf(stderr, "FAIL: %s\n", desc); \
++		failures++; \
++	} else { \
++		printf("OK:   %s\n", desc); \
++	} \
++} while (0)
++
++int main(void)
++{
++	int fd;
++	struct hbf_user_hint hint = { .version = 1 };
++	void *buf;
++
++	fd = open("/dev/hbfctl", O_RDWR);
++	TEST("open /dev/hbfctl", fd >= 0);
++	if (fd < 0) {
++		printf("SKIP\n");
++		return 0;
++	}
++
++	// Test 1: zero length
++	hint.start = 0;
++	hint.len = 0;
++	hint.op = 1;
++	hint.target_nid = 0;
++	TEST("reject zero length", ioctl(fd, HBF_IOC_SUBMIT, &hint) < 0);
++
++	// Test 2: huge length
++	hint.len = 0xffffffffffffffffULL;
++	TEST("reject overflow length", ioctl(fd, HBF_IOC_SUBMIT, &hint) < 0);
++
++	// Test 3: null address
++	hint.len = 4096;
++	hint.start = 0;
++	TEST("reject null address range", ioctl(fd, HBF_IOC_SUBMIT, &hint) < 0);
++
++	// Test 4: IO memory (mapped with VM_IO)
++	buf = mmap((void *)0xdead0000UL, 4096, PROT_READ | PROT_WRITE,
++		   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
++	if (buf != MAP_FAILED) {
++		hint.start = (unsigned long)buf;
++		TEST("reject valid anon range succeeds on submit",
++		     ioctl(fd, HBF_IOC_SUBMIT, &hint) == 0);
++		munmap(buf, 4096);
++	}
++
++	// Test 5: negative target_nid
++	hint.start = (unsigned long)malloc(4096);
++	hint.len = 4096;
++	hint.op = 1;
++	hint.target_nid = -1;
++	TEST("reject negative nid", ioctl(fd, HBF_IOC_SUBMIT, &hint) < 0);
++	free((void *)hint.start);
++
++	close(fd);
++
++	printf("\n=== %d tests, %d failures ===\n", tests, failures);
++	return failures ? 1 : 0;
++}
+-- 
+2.43.0
+

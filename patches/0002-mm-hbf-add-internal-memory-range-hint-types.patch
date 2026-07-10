@@ -1,0 +1,251 @@
+From 897585ad9f1a6ece8e80f90ad799006770670778 Mon Sep 17 00:00:00 2001
+From: Manish KL <manishklach@gmail.com>
+Date: Fri, 10 Jul 2026 00:47:45 -0700
+Subject: [PATCH 2/7] mm: hbf: add internal memory range hint types
+
+Define the internal interface for memory tier hints:
+
+- enum mm_tier_hint_op: PREFETCH, PROMOTE, DEMOTE, RELEASE
+- struct mm_tier_range_hint: the core internal hint descriptor
+- struct hbf_request: async request with state machine, timestamps,
+  page counters, and reference-counted lifetime
+- struct hbf_backend_ops: pluggable backend operations
+- include/uapi/linux/hbf.h: thin userspace-facing struct for /dev/hbfctl
+  ioctl; kept intentionally minimal to decouple ABI from core logic
+
+The UAPI header defines HBF_IOC_SUBMIT, HBF_IOC_QUERY, HBF_IOC_CANCEL,
+and HBF_IOC_CAPS commands, plus struct hbf_user_hint, hbf_query_result,
+and hbf_caps.
+
+Signed-off-by: Manish KL <manishklach@gmail.com>
+---
+ include/uapi/linux/hbf.h | 56 ++++++++++++++++++++++++++++++++++++++
+ mm/hbf/hbf_backend.h     | 33 +++++++++++++++++++++++
+ mm/hbf/hbf_request.h     | 46 +++++++++++++++++++++++++++++++
+ mm/hbf/hbf_types.h       | 58 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 193 insertions(+)
+ create mode 100644 include/uapi/linux/hbf.h
+ create mode 100644 mm/hbf/hbf_backend.h
+ create mode 100644 mm/hbf/hbf_request.h
+ create mode 100644 mm/hbf/hbf_types.h
+
+diff --git a/include/uapi/linux/hbf.h b/include/uapi/linux/hbf.h
+new file mode 100644
+index 000000000..f15b32c2a
+--- /dev/null
++++ b/include/uapi/linux/hbf.h
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_LINUX_HBF_H
++#define _UAPI_LINUX_HBF_H
++
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++#define HBF_IOCTL_MAGIC	0xBF
++
++enum hbf_hint_op {
++	HBF_HINT_PREFETCH	= 1,
++	HBF_HINT_PROMOTE	= 2,
++	HBF_HINT_DEMOTE		= 3,
++	HBF_HINT_RELEASE	= 4,
++};
++
++struct hbf_user_hint {
++	__u32	version;
++	__u32	op;
++	__u64	flags;
++	__u64	start;
++	__u64	len;
++	__s32	target_nid;
++	__u32	reserved0;
++	__u64	deadline_ns;
++	__u64	user_tag;
++	__u64	reserved[6];
++};
++
++struct hbf_query_result {
++	__u64	request_id;
++	__u32	state;
++	__u32	pad;
++	__u64	submit_ns;
++	__u64	start_ns;
++	__u64	complete_ns;
++	__u64	pages_requested;
++	__u64	pages_processed;
++	__u64	pages_moved;
++	__u64	pages_failed;
++};
++
++struct hbf_caps {
++	__u64	max_request_bytes;
++	__u32	max_inflight;
++	__u32	supported_ops;
++	__u32	max_target_nodes;
++	__u32	pad;
++};
++
++#define HBF_IOC_SUBMIT	_IOW(HBF_IOCTL_MAGIC, 0x01, struct hbf_user_hint)
++#define HBF_IOC_QUERY	_IOR(HBF_IOCTL_MAGIC, 0x02, struct hbf_query_result)
++#define HBF_IOC_CANCEL	_IOW(HBF_IOCTL_MAGIC, 0x03, __u64)
++#define HBF_IOC_CAPS	_IOR(HBF_IOCTL_MAGIC, 0x04, struct hbf_caps)
++
++#endif /* _UAPI_LINUX_HBF_H */
+diff --git a/mm/hbf/hbf_backend.h b/mm/hbf/hbf_backend.h
+new file mode 100644
+index 000000000..dc1d5620c
+--- /dev/null
++++ b/mm/hbf/hbf_backend.h
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_HBF_BACKEND_H
++#define _LINUX_HBF_BACKEND_H
++
++#include <linux/types.h>
++#include <linux/mm_types.h>
++#include <linux/list.h>
++
++struct hbf_backend_ops {
++	const char *name;
++	int (*query_range)(struct mm_struct *mm, unsigned long start,
++			   unsigned long len, int *src_nid);
++	int (*prefetch_range)(struct mm_struct *mm, unsigned long start,
++			      unsigned long len, int target_nid);
++	int (*promote_range)(struct mm_struct *mm, unsigned long start,
++			     unsigned long len, int target_nid);
++	int (*demote_range)(struct mm_struct *mm, unsigned long start,
++			    unsigned long len, int target_nid);
++	int (*release_range)(struct mm_struct *mm, unsigned long start,
++			     unsigned long len);
++	bool (*supports_target)(int nid);
++};
++
++struct hbf_backend {
++	struct list_head list;
++	const struct hbf_backend_ops *ops;
++};
++
++int hbf_register_backend(const struct hbf_backend_ops *ops);
++void hbf_unregister_backend(const struct hbf_backend_ops *ops);
++const struct hbf_backend_ops *hbf_select_backend(int target_nid);
++
++#endif /* _LINUX_HBF_BACKEND_H */
+diff --git a/mm/hbf/hbf_request.h b/mm/hbf/hbf_request.h
+new file mode 100644
+index 000000000..cd37a4c68
+--- /dev/null
++++ b/mm/hbf/hbf_request.h
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_HBF_REQUEST_H
++#define _LINUX_HBF_REQUEST_H
++
++#include "hbf_types.h"
++
++struct hbf_request {
++	u64			request_id;
++	struct mm_struct	*mm;
++	unsigned long		start;
++	unsigned long		len;
++	enum mm_tier_hint_op	op;
++	int			target_nid;
++	u64			deadline_ns;
++	u64			user_tag;
++
++	atomic_t		state;
++	u64			submit_ns;
++	u64			start_ns;
++	u64			complete_ns;
++
++	unsigned long		pages_requested;
++	unsigned long		pages_processed;
++	unsigned long		pages_moved;
++	unsigned long		pages_failed;
++
++	struct list_head	queue_node;
++	struct kref		refcount;
++	struct rcu_head		rcu;
++};
++
++struct hbf_request *hbf_request_alloc(struct mm_struct *mm,
++				      const struct mm_tier_range_hint *hint,
++				      u64 user_tag);
++void hbf_request_get(struct hbf_request *req);
++void hbf_request_put(struct hbf_request *req);
++
++int hbf_submit(struct hbf_request *req);
++int hbf_query(u64 request_id, struct hbf_request **out);
++int hbf_cancel(u64 request_id);
++void hbf_release_mm(struct mm_struct *mm);
++
++int hbf_init_request_table(void);
++void hbf_exit_request_table(void);
++
++#endif /* _LINUX_HBF_REQUEST_H */
+diff --git a/mm/hbf/hbf_types.h b/mm/hbf/hbf_types.h
+new file mode 100644
+index 000000000..1609d1f45
+--- /dev/null
++++ b/mm/hbf/hbf_types.h
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_HBF_TYPES_H
++#define _LINUX_HBF_TYPES_H
++
++#include <linux/types.h>
++#include <linux/list.h>
++#include <linux/atomic.h>
++#include <linux/kref.h>
++#include <linux/rcupdate.h>
++#include <linux/mm_types.h>
++
++enum mm_tier_hint_op {
++	MM_TIER_HINT_PREFETCH	= 1,
++	MM_TIER_HINT_PROMOTE	= 2,
++	MM_TIER_HINT_DEMOTE	= 3,
++	MM_TIER_HINT_RELEASE	= 4,
++};
++
++enum hbf_request_state {
++	HBF_REQ_SUBMITTED	= 0,
++	HBF_REQ_VALIDATED	= 1,
++	HBF_REQ_ADMITTED	= 2,
++	HBF_REQ_REJECTED	= 3,
++	HBF_REQ_QUEUED		= 4,
++	HBF_REQ_RUNNING		= 5,
++	HBF_REQ_FULL_SUCCESS	= 6,
++	HBF_REQ_PARTIAL_SUCCESS	= 7,
++	HBF_REQ_MISSED_DEADLINE	= 8,
++	HBF_REQ_CANCELLED	= 9,
++	HBF_REQ_BACKEND_FAILURE	= 10,
++};
++
++enum hbf_reject_reason {
++	HBF_REJECT_INVALID_OP		= 1,
++	HBF_REJECT_INVALID_RANGE	= 2,
++	HBF_REJECT_UNMAPPED		= 3,
++	HBF_REJECT_CROSS_PROCESS	= 4,
++	HBF_REJECT_OVERFLOW		= 5,
++	HBF_REJECT_QUEUE_FULL		= 6,
++	HBF_REJECT_BUDGET_EXCEEDED	= 7,
++	HBF_REJECT_DEADLINE_IMPOSSIBLE	= 8,
++	HBF_REJECT_UNSUPPORTED_BACKEND	= 9,
++};
++
++struct mm_tier_range_hint {
++	unsigned long		start;
++	unsigned long		len;
++	enum mm_tier_hint_op	op;
++	int			target_nid;
++	u64			deadline_ns;
++	u64			cookie;
++};
++
++#define HBF_MAX_REQUESTS_PER_PROC	64
++#define HBF_MAX_BYTES_PER_REQUEST	(1UL << 30)
++#define HBF_MAX_INFLIGHT_GLOBAL		16
++
++#endif /* _LINUX_HBF_TYPES_H */
+-- 
+2.43.0
+

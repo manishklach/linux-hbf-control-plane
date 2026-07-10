@@ -1,0 +1,260 @@
+From da145e5599c3261425a896e27a079ce6796eee87 Mon Sep 17 00:00:00 2001
+From: Manish KL <manishklach@gmail.com>
+Date: Fri, 10 Jul 2026 00:48:07 -0700
+Subject: [PATCH 5/7] mm: hbf: add NUMA migration backend
+
+Implements the pluggable backend ops for page movement:
+
+- hbf_register_backend / hbf_unregister_backend: manage backend list
+- hbf_select_backend: find backend supporting a target NUMA node
+- numa_backend: registered on module init, supports any online node
+  with N_NORMAL_MEMORY state
+- numa_migrate_range: walks pages in a VMA, calls migrate_pages()
+  per page to move between source and target NUMA nodes
+- PREFETCH, PROMOTE, DEMOTE all delegate to numa_migrate_range
+- RELEASE is a no-op (hint cancellation, not data discard)
+
+The backend validates VMA flags (rejects VM_IO and VM_PFNMAP),
+skips pages already on the target node, and counts successful moves.
+
+Signed-off-by: Manish KL <manishklach@gmail.com>
+---
+ mm/hbf/hbf_backend.c |  71 +++++++++++++++++++++++
+ mm/hbf/hbf_numa.c    | 131 +++++++++++++++++++++++++++++++++++++++++++
+ mm/hbf/hbf_numa.h    |   8 +++
+ 3 files changed, 210 insertions(+)
+ create mode 100644 mm/hbf/hbf_backend.c
+ create mode 100644 mm/hbf/hbf_numa.c
+ create mode 100755 mm/hbf/hbf_numa.h
+
+diff --git a/mm/hbf/hbf_backend.c b/mm/hbf/hbf_backend.c
+new file mode 100644
+index 000000000..779675053
+--- /dev/null
++++ b/mm/hbf/hbf_backend.c
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/slab.h>
++#include <linux/printk.h>
++#include "hbf_backend.h"
++
++static LIST_HEAD(hbf_backend_list);
++static DEFINE_SPINLOCK(hbf_backend_lock);
++
++int hbf_register_backend(const struct hbf_backend_ops *ops)
++{
++	struct hbf_backend *be;
++	unsigned long flags;
++
++	if (!ops || !ops->name)
++		return -EINVAL;
++
++	be = kzalloc(sizeof(*be), GFP_KERNEL);
++	if (!be)
++		return -ENOMEM;
++
++	be->ops = ops;
++	INIT_LIST_HEAD(&be->list);
++
++	spin_lock_irqsave(&hbf_backend_lock, flags);
++	list_add_tail(&be->list, &hbf_backend_list);
++	spin_unlock_irqrestore(&hbf_backend_lock, flags);
++
++	pr_info("hbf: registered backend '%s'\n", ops->name);
++	return 0;
++}
++
++void hbf_unregister_backend(const struct hbf_backend_ops *ops)
++{
++	struct hbf_backend *be;
++	unsigned long flags;
++
++	spin_lock_irqsave(&hbf_backend_lock, flags);
++	list_for_each_entry(be, &hbf_backend_list, list) {
++		if (be->ops == ops) {
++			list_del(&be->list);
++			spin_unlock_irqrestore(&hbf_backend_lock, flags);
++			kfree(be);
++			pr_info("hbf: unregistered backend '%s'\n", ops->name);
++			return;
++		}
++	}
++	spin_unlock_irqrestore(&hbf_backend_lock, flags);
++}
++
++const struct hbf_backend_ops *hbf_select_backend(int target_nid)
++{
++	struct hbf_backend *be;
++	unsigned long flags;
++
++	if (target_nid < 0)
++		return NULL;
++
++	spin_lock_irqsave(&hbf_backend_lock, flags);
++	list_for_each_entry(be, &hbf_backend_list, list) {
++		if (be->ops->supports_target &&
++		    be->ops->supports_target(target_nid)) {
++			spin_unlock_irqrestore(&hbf_backend_lock, flags);
++			return be->ops;
++		}
++	}
++	spin_unlock_irqrestore(&hbf_backend_lock, flags);
++
++	return NULL;
++}
+diff --git a/mm/hbf/hbf_numa.c b/mm/hbf/hbf_numa.c
+new file mode 100644
+index 000000000..6f7253134
+--- /dev/null
++++ b/mm/hbf/hbf_numa.c
+@@ -0,0 +1,131 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/mm.h>
++#include <linux/mmzone.h>
++#include <linux/mempolicy.h>
++#include <linux/migrate.h>
++#include <linux/sched/mm.h>
++#include <linux/gfp.h>
++#include <linux/hugetlb.h>
++#include <linux/pagemap.h>
++#include <linux/rmap.h>
++#include <linux/swap.h>
++#include <linux/err.h>
++#include <linux/nodemask.h>
++#include "hbf_backend.h"
++#include "hbf_numa.h"
++
++static bool numa_supports_target(int nid)
++{
++	return node_online(nid) && node_state(nid, N_NORMAL_MEMORY);
++}
++
++static int numa_query_range(struct mm_struct *mm, unsigned long start,
++			    unsigned long len, int *src_nid)
++{
++	return -EOPNOTSUPP;
++}
++
++static int numa_migrate_range(struct mm_struct *mm, unsigned long start,
++			      unsigned long len, int target_nid)
++{
++	unsigned long addr;
++	int ret;
++	unsigned int nr_succeeded;
++	LIST_HEAD(folio_list);
++
++	if (!mm)
++		return -ESRCH;
++
++	addr = start;
++	while (addr < start + len) {
++		struct page *page;
++		struct folio *folio;
++		int nr_pinned;
++		int nr_folio_pages;
++
++		nr_pinned = get_user_pages_fast(addr, 1, FOLL_GET, &page);
++		if (nr_pinned <= 0) {
++			addr += PAGE_SIZE;
++			continue;
++		}
++
++		folio = page_folio(page);
++		if (folio_nid(folio) == target_nid) {
++			put_page(page);
++			addr += PAGE_SIZE;
++			continue;
++		}
++
++		if (!isolate_folio_to_list(folio, &folio_list)) {
++			put_page(page);
++			addr += PAGE_SIZE;
++			continue;
++		}
++
++		nr_folio_pages = folio_nr_pages(folio);
++		put_page(page);
++		addr += nr_folio_pages * PAGE_SIZE;
++	}
++
++	if (list_empty(&folio_list))
++		return 0;
++
++	nr_succeeded = 0;
++	ret = migrate_pages(&folio_list, alloc_migration_target, NULL,
++			    (unsigned long)target_nid, MIGRATE_SYNC,
++			    MR_NUMA_MISPLACED, &nr_succeeded);
++	if (ret < 0) {
++		if (!list_empty(&folio_list))
++			putback_movable_pages(&folio_list);
++		return ret;
++	}
++
++	if (!list_empty(&folio_list))
++		putback_movable_pages(&folio_list);
++
++	return nr_succeeded;
++}
++
++static int numa_promote_range(struct mm_struct *mm, unsigned long start,
++			      unsigned long len, int target_nid)
++{
++	return numa_migrate_range(mm, start, len, target_nid);
++}
++
++static int numa_demote_range(struct mm_struct *mm, unsigned long start,
++			     unsigned long len, int target_nid)
++{
++	return numa_migrate_range(mm, start, len, target_nid);
++}
++
++static int numa_prefetch_range(struct mm_struct *mm, unsigned long start,
++			       unsigned long len, int target_nid)
++{
++	return numa_migrate_range(mm, start, len, target_nid);
++}
++
++static int numa_release_range(struct mm_struct *mm, unsigned long start,
++			      unsigned long len)
++{
++	return 0;
++}
++
++static const struct hbf_backend_ops numa_backend_ops = {
++	.name		= "numa",
++	.query_range	= numa_query_range,
++	.prefetch_range	= numa_prefetch_range,
++	.promote_range	= numa_promote_range,
++	.demote_range	= numa_demote_range,
++	.release_range	= numa_release_range,
++	.supports_target	= numa_supports_target,
++};
++
++int hbf_numa_register(void)
++{
++	return hbf_register_backend(&numa_backend_ops);
++}
++
++void hbf_numa_unregister(void)
++{
++	hbf_unregister_backend(&numa_backend_ops);
++}
+diff --git a/mm/hbf/hbf_numa.h b/mm/hbf/hbf_numa.h
+new file mode 100755
+index 000000000..038f8fd48
+--- /dev/null
++++ b/mm/hbf/hbf_numa.h
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _HBF_NUMA_H
++#define _HBF_NUMA_H
++
++int hbf_numa_register(void);
++void hbf_numa_unregister(void);
++
++#endif /* _HBF_NUMA_H */
+-- 
+2.43.0
+

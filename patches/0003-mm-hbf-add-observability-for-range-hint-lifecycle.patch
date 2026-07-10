@@ -1,0 +1,686 @@
+From 8a46291b283249fe2e6db3f553caf5a6dea2a694 Mon Sep 17 00:00:00 2001
+From: Manish KL <manishklach@gmail.com>
+Date: Fri, 10 Jul 2026 00:47:52 -0700
+Subject: [PATCH 3/7] mm: hbf: add observability for range hint lifecycle
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add tracepoints covering every stage of the hint lifecycle:
+  hbf_hint_submit, hbf_hint_validate, hbf_hint_reject, hbf_hint_queue,
+  hbf_hint_start, hbf_page_move, hbf_hint_complete, hbf_hint_cancel,
+  hbf_demand_touch, hbf_deadline_miss, hbf_queue_full
+
+Add debugfs interface at /sys/kernel/debug/hbf/ with:
+  stats     — cumulative counters
+  backends  — registered backend list
+  reset_stats — write 1 to clear counters
+
+Signed-off-by: Manish KL <manishklach@gmail.com>
+---
+ include/trace/events/hbf.h | 249 ++++++++++++++++++++++++++++++++++++
+ mm/hbf/hbf_debugfs.c       | 103 +++++++++++++++
+ mm/hbf/hbf_debugfs.h       |  13 ++
+ mm/hbf/hbf_tracepoints.c   |   3 +
+ mm/hbf/hbf_tracepoints.h   | 253 +++++++++++++++++++++++++++++++++++++
+ 5 files changed, 621 insertions(+)
+ create mode 100755 include/trace/events/hbf.h
+ create mode 100644 mm/hbf/hbf_debugfs.c
+ create mode 100644 mm/hbf/hbf_debugfs.h
+ create mode 100755 mm/hbf/hbf_tracepoints.c
+ create mode 100644 mm/hbf/hbf_tracepoints.h
+
+diff --git a/include/trace/events/hbf.h b/include/trace/events/hbf.h
+new file mode 100755
+index 000000000..ee64e836b
+--- /dev/null
++++ b/include/trace/events/hbf.h
+@@ -0,0 +1,249 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM hbf
++
++#if !defined(_TRACE_HBF_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_HBF_H
++
++#include <linux/tracepoint.h>
++#include <linux/trace_seq.h>
++
++DECLARE_EVENT_CLASS(hbf_hint_class,
++
++	TP_PROTO(u64 request_id, pid_t pid, pid_t tgid,
++		 int op, unsigned long start,
++		 unsigned long len, int target_nid),
++
++	TP_ARGS(request_id, pid, tgid, op, start, len, target_nid),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(pid_t, pid)
++		__field(pid_t, tgid)
++		__field(int, op)
++		__field(unsigned long, start)
++		__field(unsigned long, len)
++		__field(int, target_nid)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->pid = pid;
++		__entry->tgid = tgid;
++		__entry->op = op;
++		__entry->start = start;
++		__entry->len = len;
++		__entry->target_nid = target_nid;
++	),
++
++	TP_printk("req=%llu pid=%d tgid=%d op=%d start=%lx len=%lx nid=%d",
++		  __entry->request_id, __entry->pid, __entry->tgid,
++		  __entry->op, __entry->start, __entry->len,
++		  __entry->target_nid)
++);
++
++DEFINE_EVENT(hbf_hint_class, hbf_hint_submit,
++	TP_PROTO(u64 request_id, pid_t pid, pid_t tgid,
++		 int op, unsigned long start,
++		 unsigned long len, int target_nid),
++	TP_ARGS(request_id, pid, tgid, op, start, len, target_nid)
++);
++
++DEFINE_EVENT(hbf_hint_class, hbf_hint_validate,
++	TP_PROTO(u64 request_id, pid_t pid, pid_t tgid,
++		 int op, unsigned long start,
++		 unsigned long len, int target_nid),
++	TP_ARGS(request_id, pid, tgid, op, start, len, target_nid)
++);
++
++TRACE_EVENT(hbf_hint_reject,
++
++	TP_PROTO(u64 request_id, int reason),
++
++	TP_ARGS(request_id, reason),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(int, reason)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->reason = reason;
++	),
++
++	TP_printk("req=%llu reason=%d", __entry->request_id, __entry->reason)
++);
++
++DEFINE_EVENT(hbf_hint_class, hbf_hint_queue,
++	TP_PROTO(u64 request_id, pid_t pid, pid_t tgid,
++		 int op, unsigned long start,
++		 unsigned long len, int target_nid),
++	TP_ARGS(request_id, pid, tgid, op, start, len, target_nid)
++);
++
++TRACE_EVENT(hbf_hint_start,
++
++	TP_PROTO(u64 request_id, int src_nid, int target_nid),
++
++	TP_ARGS(request_id, src_nid, target_nid),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(int, src_nid)
++		__field(int, target_nid)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->src_nid = src_nid;
++		__entry->target_nid = target_nid;
++	),
++
++	TP_printk("req=%llu src_nid=%d dst_nid=%d",
++		  __entry->request_id, __entry->src_nid, __entry->target_nid)
++);
++
++TRACE_EVENT(hbf_page_move,
++
++	TP_PROTO(u64 request_id, unsigned long pfn,
++		 int src_nid, int dst_nid, int success),
++
++	TP_ARGS(request_id, pfn, src_nid, dst_nid, success),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(unsigned long, pfn)
++		__field(int, src_nid)
++		__field(int, dst_nid)
++		__field(int, success)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->pfn = pfn;
++		__entry->src_nid = src_nid;
++		__entry->dst_nid = dst_nid;
++		__entry->success = success;
++	),
++
++	TP_printk("req=%llu pfn=%lx src=%d dst=%d ok=%d",
++		  __entry->request_id, __entry->pfn,
++		  __entry->src_nid, __entry->dst_nid, __entry->success)
++);
++
++TRACE_EVENT(hbf_hint_complete,
++
++	TP_PROTO(u64 request_id, int state, unsigned long pages_moved,
++		 unsigned long pages_failed, u64 duration_ns,
++		 u64 queue_delay_ns),
++
++	TP_ARGS(request_id, state, pages_moved, pages_failed,
++		duration_ns, queue_delay_ns),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(int, state)
++		__field(unsigned long, pages_moved)
++		__field(unsigned long, pages_failed)
++		__field(u64, duration_ns)
++		__field(u64, queue_delay_ns)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->state = state;
++		__entry->pages_moved = pages_moved;
++		__entry->pages_failed = pages_failed;
++		__entry->duration_ns = duration_ns;
++		__entry->queue_delay_ns = queue_delay_ns;
++	),
++
++	TP_printk("req=%llu state=%d moved=%lu failed=%lu dur=%llu qdel=%llu",
++		  __entry->request_id, __entry->state,
++		  __entry->pages_moved, __entry->pages_failed,
++		  __entry->duration_ns, __entry->queue_delay_ns)
++);
++
++TRACE_EVENT(hbf_hint_cancel,
++
++	TP_PROTO(u64 request_id),
++
++	TP_ARGS(request_id),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++	),
++
++	TP_printk("req=%llu", __entry->request_id)
++);
++
++TRACE_EVENT(hbf_deadline_miss,
++
++	TP_PROTO(u64 request_id, u64 overrun_ns),
++
++	TP_ARGS(request_id, overrun_ns),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(u64, overrun_ns)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->overrun_ns = overrun_ns;
++	),
++
++	TP_printk("req=%llu overrun=%llu ns",
++		  __entry->request_id, __entry->overrun_ns)
++);
++
++TRACE_EVENT(hbf_demand_touch,
++
++	TP_PROTO(unsigned long addr, pid_t pid, pid_t tgid),
++
++	TP_ARGS(addr, pid, tgid),
++
++	TP_STRUCT__entry(
++		__field(unsigned long, addr)
++		__field(pid_t, pid)
++		__field(pid_t, tgid)
++	),
++
++	TP_fast_assign(
++		__entry->addr = addr;
++		__entry->pid = pid;
++		__entry->tgid = tgid;
++	),
++
++	TP_printk("addr=%lx pid=%d tgid=%d",
++		  __entry->addr, __entry->pid, __entry->tgid)
++);
++
++TRACE_EVENT(hbf_queue_full,
++
++	TP_PROTO(u64 request_id, int queue_depth),
++
++	TP_ARGS(request_id, queue_depth),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(int, queue_depth)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->queue_depth = queue_depth;
++	),
++
++	TP_printk("req=%llu depth=%d", __entry->request_id, __entry->queue_depth)
++);
++
++#endif /* _TRACE_HBF_H */
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>
+diff --git a/mm/hbf/hbf_debugfs.c b/mm/hbf/hbf_debugfs.c
+new file mode 100644
+index 000000000..8c506db25
+--- /dev/null
++++ b/mm/hbf/hbf_debugfs.c
+@@ -0,0 +1,103 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++#include <linux/atomic.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include "hbf_types.h"
++#include "hbf_backend.h"
++#include "hbf_request.h"
++#include "hbf_debugfs.h"
++
++static struct dentry *hbf_debugfs_root;
++
++struct hbf_stats {
++	atomic64_t		total_submitted;
++	atomic64_t		total_accepted;
++	atomic64_t		total_rejected;
++	atomic64_t		total_completed;
++	atomic64_t		total_failed;
++	atomic64_t		total_bytes_moved;
++	atomic64_t		total_deadline_misses;
++	atomic64_t		total_cancelled;
++};
++
++static struct hbf_stats hbf_stats;
++
++static __maybe_unused void hbf_stat_inc(atomic64_t *counter)
++{
++	atomic64_inc(counter);
++}
++
++static __maybe_unused void hbf_stat_add(atomic64_t *counter, u64 val)
++{
++	atomic64_add(val, counter);
++}
++
++static int hbf_stats_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "submitted\t\t%llu\n",
++		   atomic64_read(&hbf_stats.total_submitted));
++	seq_printf(m, "accepted\t\t%llu\n",
++		   atomic64_read(&hbf_stats.total_accepted));
++	seq_printf(m, "rejected\t\t%llu\n",
++		   atomic64_read(&hbf_stats.total_rejected));
++	seq_printf(m, "completed\t\t%llu\n",
++		   atomic64_read(&hbf_stats.total_completed));
++	seq_printf(m, "failed\t\t\t%llu\n",
++		   atomic64_read(&hbf_stats.total_failed));
++	seq_printf(m, "bytes_moved\t\t%llu\n",
++		   atomic64_read(&hbf_stats.total_bytes_moved));
++	seq_printf(m, "deadline_misses\t\t%llu\n",
++		   atomic64_read(&hbf_stats.total_deadline_misses));
++	seq_printf(m, "cancelled\t\t%llu\n",
++		   atomic64_read(&hbf_stats.total_cancelled));
++	return 0;
++}
++
++DEFINE_SHOW_ATTRIBUTE(hbf_stats);
++
++static int hbf_backends_show(struct seq_file *m, void *v)
++{
++	seq_puts(m, "backend\t\tquery\tprefetch\tpromote\tdemote\trelease\n");
++	return 0;
++}
++
++DEFINE_SHOW_ATTRIBUTE(hbf_backends);
++
++static int hbf_reset_stats_set(void *data, u64 val)
++{
++	if (val == 1) {
++		atomic64_set(&hbf_stats.total_submitted, 0);
++		atomic64_set(&hbf_stats.total_accepted, 0);
++		atomic64_set(&hbf_stats.total_rejected, 0);
++		atomic64_set(&hbf_stats.total_completed, 0);
++		atomic64_set(&hbf_stats.total_failed, 0);
++		atomic64_set(&hbf_stats.total_bytes_moved, 0);
++		atomic64_set(&hbf_stats.total_deadline_misses, 0);
++		atomic64_set(&hbf_stats.total_cancelled, 0);
++	}
++	return 0;
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(hbf_reset_stats_fops, NULL, hbf_reset_stats_set, "%llu");
++
++int hbf_init_debugfs(void)
++{
++	hbf_debugfs_root = debugfs_create_dir("hbf", NULL);
++	if (IS_ERR(hbf_debugfs_root))
++		return PTR_ERR(hbf_debugfs_root);
++
++	debugfs_create_file("stats", 0444, hbf_debugfs_root, NULL,
++			    &hbf_stats_fops);
++	debugfs_create_file("backends", 0444, hbf_debugfs_root, NULL,
++			    &hbf_backends_fops);
++	debugfs_create_file("reset_stats", 0200, hbf_debugfs_root, NULL,
++			    &hbf_reset_stats_fops);
++	return 0;
++}
++
++void hbf_exit_debugfs(void)
++{
++	debugfs_remove_recursive(hbf_debugfs_root);
++}
+diff --git a/mm/hbf/hbf_debugfs.h b/mm/hbf/hbf_debugfs.h
+new file mode 100644
+index 000000000..c2da0bf06
+--- /dev/null
++++ b/mm/hbf/hbf_debugfs.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _HBF_DEBUGFS_H
++#define _HBF_DEBUGFS_H
++
++#ifdef CONFIG_DEBUG_FS
++int hbf_init_debugfs(void);
++void hbf_exit_debugfs(void);
++#else
++static inline int hbf_init_debugfs(void) { return 0; }
++static inline void hbf_exit_debugfs(void) { }
++#endif
++
++#endif /* _HBF_DEBUGFS_H */
+diff --git a/mm/hbf/hbf_tracepoints.c b/mm/hbf/hbf_tracepoints.c
+new file mode 100755
+index 000000000..699fdcf55
+--- /dev/null
++++ b/mm/hbf/hbf_tracepoints.c
+@@ -0,0 +1,3 @@
++// SPDX-License-Identifier: GPL-2.0
++#define CREATE_TRACE_POINTS
++#include <trace/events/hbf.h>
+diff --git a/mm/hbf/hbf_tracepoints.h b/mm/hbf/hbf_tracepoints.h
+new file mode 100644
+index 000000000..eaaacd3e5
+--- /dev/null
++++ b/mm/hbf/hbf_tracepoints.h
+@@ -0,0 +1,253 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM hbf
++
++#if !defined(_HBF_TRACEPOINTS_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _HBF_TRACEPOINTS_H
++
++#include <linux/tracepoint.h>
++#include <linux/trace_seq.h>
++#include "hbf_types.h"
++
++DECLARE_EVENT_CLASS(hbf_hint_class,
++
++	TP_PROTO(u64 request_id, pid_t pid, pid_t tgid,
++		 enum mm_tier_hint_op op, unsigned long start,
++		 unsigned long len, int target_nid),
++
++	TP_ARGS(request_id, pid, tgid, op, start, len, target_nid),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(pid_t, pid)
++		__field(pid_t, tgid)
++		__field(int, op)
++		__field(unsigned long, start)
++		__field(unsigned long, len)
++		__field(int, target_nid)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->pid = pid;
++		__entry->tgid = tgid;
++		__entry->op = op;
++		__entry->start = start;
++		__entry->len = len;
++		__entry->target_nid = target_nid;
++	),
++
++	TP_printk("req=%llu pid=%d tgid=%d op=%d start=%lx len=%lx nid=%d",
++		  __entry->request_id, __entry->pid, __entry->tgid,
++		  __entry->op, __entry->start, __entry->len,
++		  __entry->target_nid)
++);
++
++DEFINE_EVENT(hbf_hint_class, hbf_hint_submit,
++	TP_PROTO(u64 request_id, pid_t pid, pid_t tgid,
++		 enum mm_tier_hint_op op, unsigned long start,
++		 unsigned long len, int target_nid),
++	TP_ARGS(request_id, pid, tgid, op, start, len, target_nid)
++);
++
++DEFINE_EVENT(hbf_hint_class, hbf_hint_validate,
++	TP_PROTO(u64 request_id, pid_t pid, pid_t tgid,
++		 enum mm_tier_hint_op op, unsigned long start,
++		 unsigned long len, int target_nid),
++	TP_ARGS(request_id, pid, tgid, op, start, len, target_nid)
++);
++
++TRACE_EVENT(hbf_hint_reject,
++
++	TP_PROTO(u64 request_id, int reason),
++
++	TP_ARGS(request_id, reason),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(int, reason)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->reason = reason;
++	),
++
++	TP_printk("req=%llu reason=%d", __entry->request_id, __entry->reason)
++);
++
++DEFINE_EVENT(hbf_hint_class, hbf_hint_queue,
++	TP_PROTO(u64 request_id, pid_t pid, pid_t tgid,
++		 enum mm_tier_hint_op op, unsigned long start,
++		 unsigned long len, int target_nid),
++	TP_ARGS(request_id, pid, tgid, op, start, len, target_nid)
++);
++
++TRACE_EVENT(hbf_hint_start,
++
++	TP_PROTO(u64 request_id, int src_nid, int target_nid),
++
++	TP_ARGS(request_id, src_nid, target_nid),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(int, src_nid)
++		__field(int, target_nid)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->src_nid = src_nid;
++		__entry->target_nid = target_nid;
++	),
++
++	TP_printk("req=%llu src_nid=%d dst_nid=%d",
++		  __entry->request_id, __entry->src_nid, __entry->target_nid)
++);
++
++TRACE_EVENT(hbf_page_move,
++
++	TP_PROTO(u64 request_id, unsigned long pfn,
++		 int src_nid, int dst_nid, int success),
++
++	TP_ARGS(request_id, pfn, src_nid, dst_nid, success),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(unsigned long, pfn)
++		__field(int, src_nid)
++		__field(int, dst_nid)
++		__field(int, success)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->pfn = pfn;
++		__entry->src_nid = src_nid;
++		__entry->dst_nid = dst_nid;
++		__entry->success = success;
++	),
++
++	TP_printk("req=%llu pfn=%lx src=%d dst=%d ok=%d",
++		  __entry->request_id, __entry->pfn,
++		  __entry->src_nid, __entry->dst_nid, __entry->success)
++);
++
++TRACE_EVENT(hbf_hint_complete,
++
++	TP_PROTO(u64 request_id, int state, unsigned long pages_moved,
++		 unsigned long pages_failed, u64 duration_ns,
++		 u64 queue_delay_ns),
++
++	TP_ARGS(request_id, state, pages_moved, pages_failed,
++		duration_ns, queue_delay_ns),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(int, state)
++		__field(unsigned long, pages_moved)
++		__field(unsigned long, pages_failed)
++		__field(u64, duration_ns)
++		__field(u64, queue_delay_ns)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->state = state;
++		__entry->pages_moved = pages_moved;
++		__entry->pages_failed = pages_failed;
++		__entry->duration_ns = duration_ns;
++		__entry->queue_delay_ns = queue_delay_ns;
++	),
++
++	TP_printk("req=%llu state=%d moved=%lu failed=%lu dur=%llu qdel=%llu",
++		  __entry->request_id, __entry->state,
++		  __entry->pages_moved, __entry->pages_failed,
++		  __entry->duration_ns, __entry->queue_delay_ns)
++);
++
++TRACE_EVENT(hbf_hint_cancel,
++
++	TP_PROTO(u64 request_id),
++
++	TP_ARGS(request_id),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++	),
++
++	TP_printk("req=%llu", __entry->request_id)
++);
++
++TRACE_EVENT(hbf_deadline_miss,
++
++	TP_PROTO(u64 request_id, u64 overrun_ns),
++
++	TP_ARGS(request_id, overrun_ns),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(u64, overrun_ns)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->overrun_ns = overrun_ns;
++	),
++
++	TP_printk("req=%llu overrun=%llu ns",
++		  __entry->request_id, __entry->overrun_ns)
++);
++
++TRACE_EVENT(hbf_demand_touch,
++
++	TP_PROTO(unsigned long addr, pid_t pid, pid_t tgid),
++
++	TP_ARGS(addr, pid, tgid),
++
++	TP_STRUCT__entry(
++		__field(unsigned long, addr)
++		__field(pid_t, pid)
++		__field(pid_t, tgid)
++	),
++
++	TP_fast_assign(
++		__entry->addr = addr;
++		__entry->pid = pid;
++		__entry->tgid = tgid;
++	),
++
++	TP_printk("addr=%lx pid=%d tgid=%d",
++		  __entry->addr, __entry->pid, __entry->tgid)
++);
++
++TRACE_EVENT(hbf_queue_full,
++
++	TP_PROTO(u64 request_id, int queue_depth),
++
++	TP_ARGS(request_id, queue_depth),
++
++	TP_STRUCT__entry(
++		__field(u64, request_id)
++		__field(int, queue_depth)
++	),
++
++	TP_fast_assign(
++		__entry->request_id = request_id;
++		__entry->queue_depth = queue_depth;
++	),
++
++	TP_printk("req=%llu depth=%d", __entry->request_id, __entry->queue_depth)
++);
++
++#endif /* _HBF_TRACEPOINTS_H */
++
++#undef TRACE_INCLUDE_PATH
++#undef TRACE_INCLUDE_FILE
++#define TRACE_INCLUDE_PATH mm/hbf
++#define TRACE_INCLUDE_FILE hbf_tracepoints
++#include <trace/define_trace.h>
+-- 
+2.43.0
+

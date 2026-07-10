@@ -1,85 +1,117 @@
 # Testing
 
-## Local Validation
+## Prerequisites
 
-Run:
+- Linux kernel tree (clone of `torvalds/linux.git`)
+- Build tools (`gcc`, `make`, `flex`, `bison`, `openssl-dev`, `elfutils-libelf-dev`)
+- QEMU (for boot tests)
+- `numactl` and `libnuma-dev` (for NUMA tests)
+- `bpftrace` (for eBPF observability)
 
-```bash
-./scripts/check-patch.sh
-```
-
-The script should:
-
-- verify that `rfc-hbf-linux-control-plane.patch` exists
-- compile `examples/hbfctl-demo.c`
-- run `scripts/checkpatch.pl --strict` when `KERNEL_TREE` is set
-- print instructions when `KERNEL_TREE` is absent
-
-The absence of `KERNEL_TREE` should not be treated as a failure. C compile failures should.
-
-## Kernel Workflow References
-
-Before any manual RFC preparation in a real kernel tree, review:
-
-- Linux patch submission guide:
-  [https://kernel.org/doc/html/next/process/submitting-patches.html](https://kernel.org/doc/html/next/process/submitting-patches.html)
-- Linux patch submission checklist:
-  [https://www.kernel.org/doc/html/latest/process/submit-checklist.html](https://www.kernel.org/doc/html/latest/process/submit-checklist.html)
-
-And run:
-
-- `scripts/checkpatch.pl`
-- `sparse`
-
-## Patch Style
-
-If a Linux source tree is available:
+## Apply Patches
 
 ```bash
 export KERNEL_TREE=/path/to/linux
-$KERNEL_TREE/scripts/checkpatch.pl --strict rfc-hbf-linux-control-plane.patch
+cd $KERNEL_TREE
+git am /path/to/patches/000*.patch
 ```
 
-## Static Checking
-
-Within a suitable Linux tree, prefer checks such as:
+## Build Kernel
 
 ```bash
-make C=1 CF="-D__CHECK_ENDIAN__" M=path/to/rfc/code
+cd $KERNEL_TREE
+make defconfig
+./scripts/config -e CONFIG_HBF_CONTROL_PLANE
+make -j$(nproc)
 ```
 
-The point is not to declare the prototype ready. The point is to keep the mechanics honest while the design is still under debate.
-
-## Userspace Example Checks
-
-Compile the demo:
+To verify no-regression without HBF:
 
 ```bash
-gcc -Wall -Wextra -O2 -o examples/hbfctl-demo examples/hbfctl-demo.c
+./scripts/config -d CONFIG_HBF_CONTROL_PLANE
+make clean && make -j$(nproc)
 ```
 
-Run examples:
+## Check Each Commit Builds
 
 ```bash
-./examples/hbfctl-demo --prefetch 0x100000 4096
-./examples/hbfctl-demo --promote 0x200000 8192
-./examples/hbfctl-demo --demote 0x300000 4096
-./examples/hbfctl-demo --pin 0x400000 4096
-./examples/hbfctl-demo --release 0x500000 4096
+cd $KERNEL_TREE
+git rebase --exec "make defconfig && ./scripts/config -e CONFIG_HBF_CONTROL_PLANE && make -j$(nproc)" master
 ```
 
-Expected behavior without a prototype kernel implementation:
+## Check Style
 
-- friendly message that `/dev/hbfctl` is absent
-- no claim that the interface exists upstream
+```bash
+cd $KERNEL_TREE
+for p in /path/to/patches/000*.patch; do
+    scripts/checkpatch.pl --strict "$p"
+done
+```
 
-## Future Validation
+## QEMU Boot Test
 
-If a real backend or credible proxy backend appears later, useful tests include:
+```bash
+cd $KERNEL_TREE
+./scripts/qemu-test.sh
+```
 
-- CXL or DAX-backed capacity exposure
-- page migration latency across tiers
-- trace replay of KV-cache access patterns
-- hint acceptance versus actual prefetch completion
-- fault-after-hint timing
-- accounting behavior under memory pressure
+This boots a minimal initrd that checks `/dev/hbfctl` presence and runs the selftests.
+
+## Run Selftests
+
+On a test machine or QEMU VM:
+
+```bash
+cd $KERNEL_TREE/tools/testing/selftests/mm
+make
+sudo ./hbf_hint_abi
+sudo ./hbf_reject_invalid
+sudo ./hbf_cancel
+sudo ./hbf_promote_demote   # requires 2+ NUMA nodes
+```
+
+## Run Benchmarks
+
+```bash
+cd benchmarks
+make
+./sequential-access 64
+./random-access 64
+./promote-pressure 128
+./memory-pressure 128 512
+```
+
+## Verify Tracepoints
+
+```bash
+sudo perf list | grep hbf
+sudo perf trace -e hbf:hbf_hint_submit,hbf:hbf_hint_complete ./hbfctl_caps
+sudo bpftrace tools/hbftrace/hbf_latency.py
+```
+
+## Verify Debugfs
+
+```bash
+sudo mount -t debugfs none /sys/kernel/debug
+cat /sys/kernel/debug/hbf/stats
+```
+
+## Expected Behavior
+
+- `/dev/hbfctl` exists with mode 0600
+- `hbfctl caps` returns nonzero capabilities
+- `hbfctl submit` returns a nonzero request_id within 1ms
+- `hbfctl query` shows state progression: SUBMITTED → QUEUED → COMPLETED
+- Invalid hints (bad op, unmapped range, overflow) return negative error codes
+- `hbfctl cancel` transitions request to CANCELLED
+- PROMOTE moves 90%+ pages to hot node (verified via numa_maps)
+- DEMOTE moves 90%+ pages back to warm node
+- No kernel memory leak on process exit (kmemleak)
+
+## Known Limitations
+
+- The NUMA backend migrates one page at a time; large ranges are slow
+- No cgroup integration yet
+- No admission control beyond queue depth
+- No anti-thrashing hysteresis
+- Deadline-aware scheduling is basic (check + skip, no priority queue)

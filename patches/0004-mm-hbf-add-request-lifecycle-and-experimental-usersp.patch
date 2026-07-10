@@ -1,0 +1,747 @@
+From 50f3f904a4c6393fb04e07e38677fa9f5484f231 Mon Sep 17 00:00:00 2001
+From: Manish KL <manishklach@gmail.com>
+Date: Fri, 10 Jul 2026 00:48:00 -0700
+Subject: [PATCH 4/7] mm: hbf: add request lifecycle and experimental userspace
+ ioctl
+
+Core request lifecycle implementation:
+- hbf_request_alloc / hbf_request_put with kref-based reference counting
+- hbf_validate: range-in-VMA check, overflow protection, IO/PFNMAP rejection
+- hbf_submit: validate, admit, enqueue on FIFO list
+- Worker on system_unbound_wq dequeues and executes via backend
+- hbf_query: lookup request by ID, return state and progress
+- hbf_cancel: cancel queued or running requests
+- hbf_release_mm: cancel all requests for an exiting process
+- Concurrent request limit (HBF_MAX_INFLIGHT_GLOBAL = 16)
+
+ioctl frontend (/dev/hbfctl):
+- HBF_IOC_SUBMIT: converts uapi->internal struct, returns request_id
+- HBF_IOC_QUERY: returns state, timestamps, page counts
+- HBF_IOC_CANCEL: cancels by request_id
+- HBF_IOC_CAPS: reports max sizes and supported operations
+
+Kconfig and Makefile integration with mm/ subsystem.
+
+Signed-off-by: Manish KL <manishklach@gmail.com>
+---
+ mm/Kconfig           |   1 +
+ mm/Makefile          |   1 +
+ mm/hbf/Kconfig       |  14 ++
+ mm/hbf/Makefile      |  12 ++
+ mm/hbf/hbf_ioctl.c   | 140 ++++++++++++++++
+ mm/hbf/hbf_ioctl.h   |   7 +
+ mm/hbf/hbf_main.c    |  73 +++++++++
+ mm/hbf/hbf_request.c | 374 +++++++++++++++++++++++++++++++++++++++++++
+ mm/hbf/hbf_request.h |   4 +
+ 9 files changed, 626 insertions(+)
+ create mode 100644 mm/hbf/Kconfig
+ create mode 100644 mm/hbf/Makefile
+ create mode 100644 mm/hbf/hbf_ioctl.c
+ create mode 100755 mm/hbf/hbf_ioctl.h
+ create mode 100644 mm/hbf/hbf_main.c
+ create mode 100644 mm/hbf/hbf_request.c
+
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 9e0ca4824..ffb48e94f 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1510,5 +1510,6 @@ config LAZY_MMU_MODE_KUNIT_TEST
+ 	  If unsure, say N.
+ 
+ source "mm/damon/Kconfig"
++source "mm/hbf/Kconfig"
+ 
+ endmenu
+diff --git a/mm/Makefile b/mm/Makefile
+index eff9f9e7e..39fdfbe83 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -133,6 +133,7 @@ obj-$(CONFIG_IDLE_PAGE_TRACKING) += page_idle.o
+ obj-$(CONFIG_DEBUG_PAGEALLOC) += debug_page_alloc.o
+ obj-$(CONFIG_DEBUG_PAGE_REF) += debug_page_ref.o
+ obj-$(CONFIG_DAMON) += damon/
++obj-$(CONFIG_HBF_CONTROL_PLANE) += hbf/
+ obj-$(CONFIG_HARDENED_USERCOPY) += usercopy.o
+ obj-$(CONFIG_PERCPU_STATS) += percpu-stats.o
+ obj-$(CONFIG_ZONE_DEVICE) += memremap.o
+diff --git a/mm/hbf/Kconfig b/mm/hbf/Kconfig
+new file mode 100644
+index 000000000..a766c4309
+--- /dev/null
++++ b/mm/hbf/Kconfig
+@@ -0,0 +1,14 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++config HBF_CONTROL_PLANE
++	tristate "HBF Memory Tier Control Plane"
++	depends on MMU
++	depends on MIGRATION
++	help
++	  Provides a runtime-guided memory-tier hint interface for AI
++	  inference workloads.  Userspace processes can submit asynchronous
++	  prefetch, promote, and demote hints to move memory pages between
++	  NUMA nodes (as proxies for hot/warm memory tiers) before demand
++	  access.
++
++	  If unsure, say N.
+diff --git a/mm/hbf/Makefile b/mm/hbf/Makefile
+new file mode 100644
+index 000000000..5774d72ab
+--- /dev/null
++++ b/mm/hbf/Makefile
+@@ -0,0 +1,12 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++obj-$(CONFIG_HBF_CONTROL_PLANE) += hbf.o
++
++hbf-objs := \
++	hbf_main.o \
++	hbf_ioctl.o \
++	hbf_request.o \
++	hbf_backend.o \
++	hbf_numa.o \
++	hbf_debugfs.o \
++	hbf_tracepoints.o
+diff --git a/mm/hbf/hbf_ioctl.c b/mm/hbf/hbf_ioctl.c
+new file mode 100644
+index 000000000..c2b86c087
+--- /dev/null
++++ b/mm/hbf/hbf_ioctl.c
+@@ -0,0 +1,140 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/fs.h>
++#include <linux/uaccess.h>
++#include <linux/miscdevice.h>
++#include <linux/sched/mm.h>
++#include <linux/err.h>
++#include <linux/nodemask.h>
++#include <uapi/linux/hbf.h>
++#include "hbf_types.h"
++#include "hbf_ioctl.h"
++#include "hbf_ioctl.h"
++#include "hbf_request.h"
++#include "hbf_backend.h"
++
++static long hbf_ioctl_submit(struct file *file, unsigned long arg)
++{
++	struct hbf_user_hint uapi;
++	struct mm_tier_range_hint hint;
++	struct hbf_request *req;
++	u64 request_id;
++	int ret;
++
++	if (copy_from_user(&uapi, (void __user *)arg, sizeof(uapi)))
++		return -EFAULT;
++
++	if (uapi.version != 1)
++		return -EINVAL;
++
++	hint.start = uapi.start;
++	hint.len = uapi.len;
++	hint.target_nid = uapi.target_nid;
++	hint.deadline_ns = uapi.deadline_ns;
++	hint.cookie = uapi.user_tag;
++
++	switch (uapi.op) {
++	case HBF_HINT_PREFETCH:
++		hint.op = MM_TIER_HINT_PREFETCH;
++		break;
++	case HBF_HINT_PROMOTE:
++		hint.op = MM_TIER_HINT_PROMOTE;
++		break;
++	case HBF_HINT_DEMOTE:
++		hint.op = MM_TIER_HINT_DEMOTE;
++		break;
++	case HBF_HINT_RELEASE:
++		hint.op = MM_TIER_HINT_RELEASE;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	req = hbf_request_alloc(current->mm, &hint, uapi.user_tag);
++	if (IS_ERR(req))
++		return PTR_ERR(req);
++
++	ret = hbf_submit(req);
++	if (ret) {
++		hbf_request_put(req);
++		return ret;
++	}
++
++	request_id = req->request_id;
++	hbf_request_put(req);
++
++	if (copy_to_user((void __user *)arg, &request_id, sizeof(request_id)))
++		return -EFAULT;
++
++	return 0;
++}
++
++static long hbf_ioctl_query(struct file *file, unsigned long arg)
++{
++	struct hbf_query_result result;
++	struct hbf_request *req;
++	int ret;
++
++	if (copy_from_user(&result, (void __user *)arg, sizeof(result)))
++		return -EFAULT;
++
++	ret = hbf_query(result.request_id, &req);
++	if (ret)
++		return ret;
++
++	result.state = atomic_read(&req->state);
++	result.submit_ns = req->submit_ns;
++	result.start_ns = req->start_ns;
++	result.complete_ns = req->complete_ns;
++	result.pages_requested = req->pages_requested;
++	result.pages_processed = req->pages_processed;
++	result.pages_moved = req->pages_moved;
++	result.pages_failed = req->pages_failed;
++
++	hbf_request_put(req);
++
++	if (copy_to_user((void __user *)arg, &result, sizeof(result)))
++		return -EFAULT;
++
++	return 0;
++}
++
++static long hbf_ioctl_cancel(struct file *file, unsigned long arg)
++{
++	u64 request_id;
++
++	if (copy_from_user(&request_id, (void __user *)arg, sizeof(request_id)))
++		return -EFAULT;
++
++	return hbf_cancel(request_id);
++}
++
++static long hbf_ioctl_caps(struct file *file, unsigned long arg)
++{
++	struct hbf_caps caps = {
++		.max_request_bytes = HBF_MAX_BYTES_PER_REQUEST,
++		.max_inflight = HBF_MAX_INFLIGHT_GLOBAL,
++		.supported_ops = 0x0f,
++		.max_target_nodes = nr_node_ids,
++	};
++
++	if (copy_to_user((void __user *)arg, &caps, sizeof(caps)))
++		return -EFAULT;
++
++	return 0;
++}
++
++long hbf_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	switch (cmd) {
++	case HBF_IOC_SUBMIT:
++		return hbf_ioctl_submit(file, arg);
++	case HBF_IOC_QUERY:
++		return hbf_ioctl_query(file, arg);
++	case HBF_IOC_CANCEL:
++		return hbf_ioctl_cancel(file, arg);
++	case HBF_IOC_CAPS:
++		return hbf_ioctl_caps(file, arg);
++	default:
++		return -ENOTTY;
++	}
++}
+diff --git a/mm/hbf/hbf_ioctl.h b/mm/hbf/hbf_ioctl.h
+new file mode 100755
+index 000000000..803874f94
+--- /dev/null
++++ b/mm/hbf/hbf_ioctl.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _HBF_IOCTL_H
++#define _HBF_IOCTL_H
++
++long hbf_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
++
++#endif /* _HBF_IOCTL_H */
+diff --git a/mm/hbf/hbf_main.c b/mm/hbf/hbf_main.c
+new file mode 100644
+index 000000000..b4f6d0241
+--- /dev/null
++++ b/mm/hbf/hbf_main.c
+@@ -0,0 +1,73 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/module.h>
++#include <linux/fs.h>
++#include <linux/miscdevice.h>
++#include "hbf_request.h"
++#include "hbf_debugfs.h"
++#include "hbf_backend.h"
++#include "hbf_ioctl.h"
++#include "hbf_numa.h"
++
++#define HBF_DEVICE_NAME	"hbfctl"
++
++static const struct file_operations hbf_fops = {
++	.owner		= THIS_MODULE,
++	.unlocked_ioctl	= hbf_ioctl,
++	.llseek		= noop_llseek,
++};
++
++static struct miscdevice hbf_miscdev = {
++	.minor	= MISC_DYNAMIC_MINOR,
++	.name	= HBF_DEVICE_NAME,
++	.fops	= &hbf_fops,
++	.mode	= 0600,
++};
++
++
++
++static int __init hbf_init(void)
++{
++	int ret;
++
++	ret = hbf_init_request_table();
++	if (ret)
++		return ret;
++
++	ret = hbf_init_debugfs();
++	if (ret)
++		goto err_debugfs;
++
++	ret = misc_register(&hbf_miscdev);
++	if (ret)
++		goto err_misc;
++
++	ret = hbf_numa_register();
++	if (ret)
++		pr_warn("hbf: NUMA backend not available\n");
++
++	pr_info("hbf: control plane initialized, /dev/%s created\n",
++		HBF_DEVICE_NAME);
++	return 0;
++
++err_misc:
++	hbf_exit_debugfs();
++err_debugfs:
++	hbf_exit_request_table();
++	return ret;
++}
++
++static void __exit hbf_exit(void)
++{
++	hbf_numa_unregister();
++	misc_deregister(&hbf_miscdev);
++	hbf_exit_debugfs();
++	hbf_exit_request_table();
++	pr_info("hbf: control plane unloaded\n");
++}
++
++module_init(hbf_init);
++module_exit(hbf_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Manish KL");
++MODULE_DESCRIPTION("HBF Memory Tier Control Plane");
+diff --git a/mm/hbf/hbf_request.c b/mm/hbf/hbf_request.c
+new file mode 100644
+index 000000000..2038c2093
+--- /dev/null
++++ b/mm/hbf/hbf_request.c
+@@ -0,0 +1,374 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/slab.h>
++#include <linux/sched.h>
++#include <linux/sched/mm.h>
++#include <linux/workqueue.h>
++#include <linux/spinlock.h>
++#include <linux/hashtable.h>
++#include <linux/ktime.h>
++#include <linux/atomic.h>
++#include <linux/mm.h>
++#include <linux/err.h>
++#include "hbf_types.h"
++#include "hbf_request.h"
++#include "hbf_backend.h"
++#include <trace/events/hbf.h>
++
++static DEFINE_HASHTABLE(hbf_request_table, 8);
++static DEFINE_SPINLOCK(hbf_request_lock);
++static atomic64_t hbf_next_id = ATOMIC64_INIT(1);
++static atomic_t hbf_inflight = ATOMIC_INIT(0);
++
++static LIST_HEAD(hbf_queue);
++static DEFINE_SPINLOCK(hbf_queue_lock);
++static struct work_struct hbf_worker;
++
++static u64 hbf_alloc_id(void)
++{
++	return atomic64_inc_return(&hbf_next_id);
++}
++
++struct hbf_request *hbf_request_alloc(struct mm_struct *mm,
++				      const struct mm_tier_range_hint *hint,
++				      u64 user_tag)
++{
++	struct hbf_request *req;
++
++	req = kzalloc(sizeof(*req), GFP_KERNEL);
++	if (!req)
++		return ERR_PTR(-ENOMEM);
++
++	req->request_id = hbf_alloc_id();
++	req->mm = mm;
++	mmgrab(mm);
++	if (!req->mm) {
++		kfree(req);
++		return ERR_PTR(-ESRCH);
++	}
++	req->start = hint->start;
++	req->len = hint->len;
++	req->op = hint->op;
++	req->target_nid = hint->target_nid;
++	req->deadline_ns = hint->deadline_ns;
++	req->user_tag = user_tag;
++
++	atomic_set(&req->state, HBF_REQ_SUBMITTED);
++	req->submit_ns = ktime_get_ns();
++	req->pages_requested = hint->len >> PAGE_SHIFT;
++
++	kref_init(&req->refcount);
++	INIT_LIST_HEAD(&req->queue_node);
++	INIT_HLIST_NODE(&req->hlist_node);
++
++	return req;
++}
++
++static void hbf_request_free(struct kref *kref)
++{
++	struct hbf_request *req = container_of(kref, struct hbf_request, refcount);
++
++	if (req->mm)
++		mmdrop(req->mm);
++	kfree_rcu(req, rcu);
++}
++
++void hbf_request_get(struct hbf_request *req)
++{
++	kref_get(&req->refcount);
++}
++
++void hbf_request_put(struct hbf_request *req)
++{
++	kref_put(&req->refcount, hbf_request_free);
++}
++
++static void hbf_add_to_table(struct hbf_request *req)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&hbf_request_lock, flags);
++	hash_add(hbf_request_table, &req->hlist_node, req->request_id);
++	spin_unlock_irqrestore(&hbf_request_lock, flags);
++}
++
++static void hbf_del_from_table(struct hbf_request *req)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&hbf_request_lock, flags);
++	hash_del(&req->hlist_node);
++	spin_unlock_irqrestore(&hbf_request_lock, flags);
++}
++
++static int hbf_validate(struct hbf_request *req)
++{
++	struct mm_struct *mm = req->mm;
++	struct vm_area_struct *vma;
++	unsigned long end;
++	int ret = 0;
++
++	if (!mm)
++		return -ESRCH;
++
++	if (req->len == 0 || req->len > HBF_MAX_BYTES_PER_REQUEST)
++		return -EINVAL;
++
++	if (check_add_overflow(req->start, req->len, &end))
++		return -EOVERFLOW;
++
++	mmap_read_lock(mm);
++	vma = find_vma_intersection(mm, req->start, end);
++	if (!vma) {
++		ret = -EFAULT;
++		goto out;
++	}
++
++	if (vma->vm_start > req->start ||
++	    vma->vm_end < end) {
++		ret = -EFAULT;
++		goto out;
++	}
++
++	if (vma->vm_flags & (VM_IO | VM_PFNMAP)) {
++		ret = -EACCES;
++		goto out;
++	}
++
++out:
++	mmap_read_unlock(mm);
++	return ret;
++}
++
++static void hbf_execute_request(struct hbf_request *req)
++{
++	const struct hbf_backend_ops *backend;
++	int ret;
++	u64 now;
++
++	now = ktime_get_ns();
++	req->start_ns = now;
++
++	atomic_set(&req->state, HBF_REQ_RUNNING);
++
++	if (req->deadline_ns && now > req->deadline_ns) {
++		atomic_set(&req->state, HBF_REQ_MISSED_DEADLINE);
++		trace_hbf_deadline_miss(req->request_id, now - req->deadline_ns);
++		goto out;
++	}
++
++	backend = hbf_select_backend(req->target_nid);
++	if (!backend) {
++		atomic_set(&req->state, HBF_REQ_BACKEND_FAILURE);
++		goto out;
++	}
++
++	switch (req->op) {
++	case MM_TIER_HINT_PREFETCH:
++		ret = backend->prefetch_range(req->mm, req->start, req->len,
++					      req->target_nid);
++		break;
++	case MM_TIER_HINT_PROMOTE:
++		ret = backend->promote_range(req->mm, req->start, req->len,
++					     req->target_nid);
++		break;
++	case MM_TIER_HINT_DEMOTE:
++		ret = backend->demote_range(req->mm, req->start, req->len,
++					    req->target_nid);
++		break;
++	case MM_TIER_HINT_RELEASE:
++		ret = backend->release_range(req->mm, req->start, req->len);
++		break;
++	default:
++		ret = -EOPNOTSUPP;
++		break;
++	}
++
++	if (ret >= 0) {
++		req->pages_moved = ret;
++		if (ret == 0 && req->pages_requested > 0)
++			atomic_set(&req->state, HBF_REQ_PARTIAL_SUCCESS);
++		else if (ret >= req->pages_requested)
++			atomic_set(&req->state, HBF_REQ_FULL_SUCCESS);
++		else
++			atomic_set(&req->state, HBF_REQ_PARTIAL_SUCCESS);
++	} else {
++		atomic_set(&req->state, HBF_REQ_BACKEND_FAILURE);
++		req->pages_failed = req->pages_requested;
++	}
++
++out:
++	req->complete_ns = ktime_get_ns();
++	trace_hbf_hint_complete(req->request_id, atomic_read(&req->state),
++				req->pages_moved, req->pages_failed,
++				req->complete_ns - req->start_ns,
++				req->start_ns - req->submit_ns);
++}
++
++static void hbf_do_work(struct work_struct *work)
++{
++	struct hbf_request *req = NULL;
++	unsigned long flags;
++
++	spin_lock_irqsave(&hbf_queue_lock, flags);
++	if (!list_empty(&hbf_queue)) {
++		req = list_first_entry(&hbf_queue, struct hbf_request,
++				       queue_node);
++		list_del_init(&req->queue_node);
++	}
++	spin_unlock_irqrestore(&hbf_queue_lock, flags);
++
++	if (req) {
++		hbf_request_get(req);
++		hbf_execute_request(req);
++		hbf_del_from_table(req);
++		atomic_dec(&hbf_inflight);
++		hbf_request_put(req);
++	}
++}
++
++int hbf_submit(struct hbf_request *req)
++{
++	unsigned long flags;
++	int ret;
++
++	trace_hbf_hint_submit(req->request_id, current->pid,
++			      current->tgid, req->op, req->start,
++			      req->len, req->target_nid);
++
++	ret = hbf_validate(req);
++	if (ret) {
++		atomic_set(&req->state, HBF_REQ_REJECTED);
++		trace_hbf_hint_reject(req->request_id, HBF_REJECT_INVALID_RANGE);
++		return ret;
++	}
++
++	atomic_set(&req->state, HBF_REQ_VALIDATED);
++
++	if (atomic_read(&hbf_inflight) >= HBF_MAX_INFLIGHT_GLOBAL) {
++		atomic_set(&req->state, HBF_REQ_REJECTED);
++		trace_hbf_queue_full(req->request_id,
++				     atomic_read(&hbf_inflight));
++		return -EAGAIN;
++	}
++
++	atomic_set(&req->state, HBF_REQ_ADMITTED);
++
++	hbf_add_to_table(req);
++
++	spin_lock_irqsave(&hbf_queue_lock, flags);
++	list_add_tail(&req->queue_node, &hbf_queue);
++	spin_unlock_irqrestore(&hbf_queue_lock, flags);
++
++	atomic_set(&req->state, HBF_REQ_QUEUED);
++	atomic_inc(&hbf_inflight);
++
++	trace_hbf_hint_queue(req->request_id, current->pid, current->tgid,
++			     req->op, req->start, req->len, req->target_nid);
++
++	schedule_work(&hbf_worker);
++
++	return 0;
++}
++
++int hbf_query(u64 request_id, struct hbf_request **out)
++{
++	struct hbf_request *req;
++	unsigned long flags;
++	int ret = -ENOENT;
++
++	spin_lock_irqsave(&hbf_request_lock, flags);
++	hash_for_each_possible(hbf_request_table, req, hlist_node, request_id) {
++		if (req->request_id == request_id) {
++			hbf_request_get(req);
++			*out = req;
++			ret = 0;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&hbf_request_lock, flags);
++
++	return ret;
++}
++
++int hbf_cancel(u64 request_id)
++{
++	struct hbf_request *req;
++	unsigned long flags;
++	int ret = -ENOENT;
++
++	spin_lock_irqsave(&hbf_request_lock, flags);
++	hash_for_each_possible(hbf_request_table, req, hlist_node, request_id) {
++		if (req->request_id == request_id) {
++			int state = atomic_read(&req->state);
++
++			if (state == HBF_REQ_QUEUED) {
++				list_del_init(&req->queue_node);
++				atomic_set(&req->state, HBF_REQ_CANCELLED);
++				hash_del(&req->hlist_node);
++				atomic_dec(&hbf_inflight);
++				trace_hbf_hint_cancel(request_id);
++				hbf_request_put(req);
++				ret = 0;
++			} else if (state >= HBF_REQ_RUNNING &&
++				   state < HBF_REQ_CANCELLED) {
++				atomic_set(&req->state, HBF_REQ_CANCELLED);
++				trace_hbf_hint_cancel(request_id);
++				ret = 0;
++			}
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&hbf_request_lock, flags);
++
++	return ret;
++}
++
++void hbf_release_mm(struct mm_struct *mm)
++{
++	struct hbf_request *req;
++	unsigned long flags;
++	int bkt;
++
++	spin_lock_irqsave(&hbf_request_lock, flags);
++	hash_for_each(hbf_request_table, bkt, req, hlist_node) {
++		if (req->mm == mm) {
++			int state = atomic_read(&req->state);
++
++			if (state == HBF_REQ_QUEUED) {
++				list_del_init(&req->queue_node);
++				atomic_dec(&hbf_inflight);
++			}
++
++			if (state < HBF_REQ_CANCELLED) {
++				atomic_set(&req->state, HBF_REQ_CANCELLED);
++				trace_hbf_hint_cancel(req->request_id);
++			}
++		}
++	}
++	spin_unlock_irqrestore(&hbf_request_lock, flags);
++}
++
++int hbf_init_request_table(void)
++{
++	hash_init(hbf_request_table);
++	spin_lock_init(&hbf_queue_lock);
++	INIT_WORK(&hbf_worker, hbf_do_work);
++	return 0;
++}
++
++void hbf_exit_request_table(void)
++{
++	struct hbf_request *req;
++	unsigned long flags;
++	int bkt;
++
++	cancel_work_sync(&hbf_worker);
++
++	spin_lock_irqsave(&hbf_request_lock, flags);
++	hash_for_each(hbf_request_table, bkt, req, hlist_node) {
++		hash_del(&req->hlist_node);
++		atomic_set(&req->state, HBF_REQ_CANCELLED);
++		hbf_request_put(req);
++	}
++	spin_unlock_irqrestore(&hbf_request_lock, flags);
++}
+diff --git a/mm/hbf/hbf_request.h b/mm/hbf/hbf_request.h
+index cd37a4c68..fb8564067 100644
+--- a/mm/hbf/hbf_request.h
++++ b/mm/hbf/hbf_request.h
+@@ -2,6 +2,9 @@
+ #ifndef _LINUX_HBF_REQUEST_H
+ #define _LINUX_HBF_REQUEST_H
+ 
++#include <linux/types.h>
++#include <linux/list.h>
++#include <linux/hashtable.h>
+ #include "hbf_types.h"
+ 
+ struct hbf_request {
+@@ -25,6 +28,7 @@ struct hbf_request {
+ 	unsigned long		pages_failed;
+ 
+ 	struct list_head	queue_node;
++	struct hlist_node	hlist_node;
+ 	struct kref		refcount;
+ 	struct rcu_head		rcu;
+ };
+-- 
+2.43.0
+

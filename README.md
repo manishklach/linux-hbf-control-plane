@@ -2,178 +2,123 @@
 
 > HBF only becomes useful when the system can move data before compute asks for it.
 
-`Experimental` `RFC` `No Upstream HBF Hardware Binding` `Not Production`
+`Experimental` `Research Platform` `v0.2 — Executable NUMA Tier Backend`
 
-`linux-hbf-control-plane` is a documentation-first RFC project around a possible Linux control plane for future HBF-like high-capacity memory tiers used by AI inference runtimes.
+A Linux-based runtime-guided memory-tier orchestration prototype that predicts future AI working-set demand, submits asynchronous range hints, and moves pages between simulated hot (DRAM) and warm (NUMA) memory tiers.
 
-This repository does **not** claim that:
+## Status: v0.2
 
-- Linux has an upstream HBF subsystem today
-- public HBF hardware programming specifications exist today
-- the current prototype patch is ready for upstream review without major revision
+The repository has evolved from a documentation-only RFC into an **executable research platform**:
 
-Instead, it explores whether runtime-guided prefetch, promote, demote, and placement hints could fit near existing Linux building blocks such as CXL, DAX, memory hotplug, memory tiering, NUMA policy, and migration.
+- **7-commit kernel series** against latest upstream Linux, each independently buildable
+- **Internal `mm_tier_range_hint` types** decoupled from UAPI (the `/dev/hbfctl` ioctl is a thin adapter)
+- **NUMA migration backend** that promotes and demotes pages between arbitrary NUMA nodes
+- **Asynchronous request queue** with state machine (SUBMITTED→VALIDATED→ADMITTED→QUEUED→RUNNING→COMPLETED)
+- **11 tracepoints** covering the full hint lifecycle
+- **debugfs statistics** at `/sys/kernel/debug/hbf/`
+- **hbfctl CLI tool** with submit/query/cancel/caps/status subcommands
+- **bpftrace observability scripts** for latency, migration, and deadline-miss analysis
+- **Benchmark suite** for sequential, random, promote-pressure, and memory-pressure tests
+- **selftests** validating ABI, promote/demote correctness, cancellation, and error handling
 
-Target model:
+## Memory Tier Model
 
-- HBF-like capacity tier exposed through CXL Type-3, DAX, or memory hotplug
-- HBF treated as a warm memory tier, not a block device
-- patch placement closer to `mm/` and `Documentation/mm/` than a standalone driver subtree
-- `/dev/hbfctl` accepted only as an RFC frontend, not a long-term ABI commitment
-
-## Problem Statement
-
-Inference runtimes increasingly manage memory hierarchies that look like this:
-
-- HBM = hot working set
-- HBF = high-capacity warm context tier
-- SSD/object store = cold tier
-
-The hard part is not naming a new tier. The hard part is moving data early enough that compute does not stall waiting for it.
-
-AI runtimes often know which tokens, sequences, KV blocks, and context ranges are likely to be touched next. Linux knows about VMAs, pages, folios, devices, DMA, NUMA nodes, migration, and tiering. A useful control plane has to connect those two views without pretending that AI semantics themselves belong directly in the MM fast path.
-
-## Why Linux Is Involved
-
-The runtime can estimate reuse distance and future demand.
-
-The kernel can:
-
-- validate ownership of mappings
-- decide whether a range can be migrated or prefetched
-- translate hints into placement or staging work
-- account memory and isolate tenants
-- observe outcomes through tracepoints and existing MM tooling
-
-That makes Linux the natural place to evaluate an advisory hint interface, especially if any future HBF-like hardware is exposed through CXL, DAX, driver-managed memory, or related heterogeneous-memory mechanisms.
-
-## Proposed Architecture
-
-The proposal is a thin runtime-to-kernel control plane, not a replacement for CXL, DAX, or memory tiering.
-The current prototype patch is intentionally `mm`-oriented rather than driver-first.
-
-```mermaid
-flowchart TD
-    A["AI Runtime"]
-    B["hbfctl hints"]
-    C["HBF policy layer"]
-    D["CXL/DAX/HBF backend"]
-    E["DMA/prefetch/promote/demote"]
-    F["HBM/DRAM/HBF placement"]
-
-    A --> B --> C --> D --> E --> F
+```
+Node 0 (fast DRAM)  →  simulated HBM (hot tier)
+Node 1 (slower)     →  simulated HBF (warm tier)
+Storage             →  cold tier (not yet controlled)
 ```
 
-The control plane is intentionally advisory:
+The NUMA backend is a proxy for future CXL-attached memory, HBF hardware, or any byte-addressable capacity tier. The control plane is backend-independent.
 
-- runtime expresses intent
-- kernel validates and admits or rejects the hint
-- backend may ignore the hint if unsupported
-- correctness must never depend on hint acceptance
+## Quick Start
 
-## What This Is
+```bash
+# Clone kernel and apply patches
+export KERNEL_TREE=/path/to/linux
+cd $KERNEL_TREE && git am /path/to/patches/000*.patch
 
-- An experimental Linux kernel control-plane proposal
-- A review target for an RFC patch under [rfc-hbf-linux-control-plane.patch](rfc-hbf-linux-control-plane.patch)
-- A research artifact for AI memory hierarchy discussion
-- A staging area for documentation, critique, and patch decomposition before any serious upstream attempt
+# Build with HBF enabled
+./scripts/config -e CONFIG_HBF_CONTROL_PLANE
+make -j$(nproc)
 
-## What This Is Not
+# Build without HBF (no-regression check)
+./scripts/config -d CONFIG_HBF_CONTROL_PLANE
+make -j$(nproc)
 
-- Not an upstream Linux driver
-- Not a shipping HBF hardware driver
-- Not proof that HBF belongs in a standalone kernel subsystem
-- Not a benchmark result
-- Not a substitute for CXL, DAX, memory tiering, or existing MM review
+# Boot in QEMU
+./scripts/qemu-test.sh
+
+# Build and use the CLI
+cd samples/hbf && gcc -Wall -O2 -o hbfctl hbfctl.c -lnuma
+./hbfctl caps
+./hbfctl submit 0x7f1234560000 2097152 -o 2 -n 0 -d 1000000000
+./hbfctl query 1
+```
+
+## Patch Series
+
+| # | Commit | Files |
+|---|---|---|
+| 1 | `doc: mm: describe runtime-guided memory tiering` | `Documentation/mm/hbf-control-plane.rst` |
+| 2 | `mm: hbf: add internal memory range hint types` | `mm/hbf/*.h`, `include/uapi/linux/hbf.h` |
+| 3 | `mm: hbf: add observability infrastructure` | `hbf_tracepoints.h`, `hbf_debugfs.c` |
+| 4 | `mm: hbf: add request lifecycle and ioctl frontend` | `hbf_request.c`, `hbf_ioctl.c`, `hbf_main.c`, Kconfig |
+| 5 | `mm: hbf: add NUMA migration backend` | `hbf_backend.c`, `hbf_numa.c` |
+| 6 | `selftests: mm: add HBF tests` | 4 test programs in `tools/testing/selftests/mm/` |
+| 7 | `samples: hbf: add hbfctl and bpftrace tools` | CLI tool, 3 bpftrace scripts |
 
 ## Repository Layout
 
-- [README.md](README.md): top-level framing and workflow
-- [rfc-hbf-linux-control-plane.patch](rfc-hbf-linux-control-plane.patch): prototype RFC patch under review
-- [docs/patch-review.md](docs/patch-review.md): critical review of the current prototype patch
-- [docs/rfc-v1-plan.md](docs/rfc-v1-plan.md): cleaner series plan for a documentation-first RFC v1
-- [docs/lkml-objections.md](docs/lkml-objections.md): likely reviewer objections and how to answer them honestly
-- [docs/api-options.md](docs/api-options.md): comparison of ABI surfaces
-- [docs/control-plane.md](docs/control-plane.md): detailed control-plane model
-- [docs/kernel-integration-map.md](docs/kernel-integration-map.md): potential subsystem landing points
-- [docs/no-block-layer.md](docs/no-block-layer.md): why the first serious RFC should target memory-tiering, not the block layer
-- [docs/benchmark-plan.md](docs/benchmark-plan.md): proxy experiments in lieu of real hardware
-- [docs/tracepoints.md](docs/tracepoints.md): observability proposal
-- [docs/testing.md](docs/testing.md): local checks and readiness steps
-- [docs/references.md](docs/references.md): upstream documentation links
-- [docs/github-positioning.md](docs/github-positioning.md): repo description and topics
-- [examples/hbfctl-demo.c](examples/hbfctl-demo.c): mock userspace ioctl example
-- [scripts/check-patch.sh](scripts/check-patch.sh): local patch and example validation helper
-- [scripts/make-rfc-series.sh](scripts/make-rfc-series.sh): instructions for generating patch series from commits
-
-The patch file is a prototype artifact. It must be regenerated from commits before any real upstream discussion.
-
-## Build And Check
-
-Local checks:
-
-```bash
-./scripts/check-patch.sh
+```
+patches/                    — 7 kernel patches (generated from commits)
+benchmarks/                 — sequential, random, promote-pressure, memory-pressure
+scripts/                    — build, QEMU test, style check, patch regeneration
+docs/                       — architecture, design rationale, API options, etc.
+samples/hbf/hbfctl.c        — userspace CLI tool
+tools/hbftrace/*.py         — bpftrace observability scripts
 ```
 
-Userspace example:
+## Architecture
 
-```bash
-gcc -Wall -Wextra -O2 -o examples/hbfctl-demo examples/hbfctl-demo.c
+```
+AI Runtime → hbfctl hints → request queue → NUMA backend → page migration → hot/warm placement
+                    ↓            ↓
+               tracepoints   debugfs stats
 ```
 
-Kernel patch style, if a kernel tree is available:
+Key principles:
+- **Advisory hints**: never correctness-critical
+- **Async execution**: SUBMIT returns request_id immediately
+- **Internal-first types**: core uses `mm_tier_range_hint`; ioctl is a replaceable adapter
+- **Observability-first**: every lifecycle event captured via tracepoints
+- **No LKML submission**: this is a local research platform
 
-```bash
-export KERNEL_TREE=/path/to/linux
-$KERNEL_TREE/scripts/checkpatch.pl --strict rfc-hbf-linux-control-plane.patch
-```
+## Acceptance Criteria Met
 
-This repository is for local development and RFC preparation only. It does not send email or submit anything.
+- [x] Kernel builds with `CONFIG_HBF_CONTROL_PLANE=y` and `=n`
+- [x] 7 commits, each independently buildable
+- [x] `/dev/hbfctl` registeres as miscdevice
+- [x] SUBMIT returns request_id without blocking
+- [x] PROMOTE moves pages to hot node
+- [x] DEMOTE moves pages to warm node
+- [x] Invalid hints return proper errors (EINVAL, EFAULT, EPERM)
+- [x] CANCEL sets request to CANCELLED state
+- [x] Process exit cleans up queued requests
+- [x] Tracepoints visible via `perf list | grep hbf`
+- [x] debugfs `stats` shows counters
 
-## How To Regenerate Patches Later
+## v0.3+ Roadmap
 
-Kernel patches should be generated from commits, not hand-maintained forever.
-
-Use:
-
-```bash
-./scripts/make-rfc-series.sh
-```
-
-That script only prints local instructions. It does **not** send email and does **not** invoke any mailing-list submission flow.
-
-## LKML Readiness Checklist
-
-Before treating any series here as ready for manual submission:
-
-- review [docs/patch-review.md](docs/patch-review.md)
-- review [docs/lkml-objections.md](docs/lkml-objections.md)
-- run `scripts/check-patch.sh`
-- run `scripts/checkpatch.pl --strict`
-- review the Linux kernel patch submission guide:
-  [`Documentation/process/submitting-patches.rst`](https://kernel.org/doc/html/next/process/submitting-patches.html)
-- review the Linux kernel patch submission checklist:
-  [`Documentation/process/submit-checklist.rst`](https://www.kernel.org/doc/html/latest/process/submit-checklist.html)
-- verify that the series is honest about missing hardware bindings and missing evidence
-- verify that no part of the ABI is being presented as settled
-
-## Roadmap
-
-- v0: prototype patch plus repo documentation
-- v1: documentation-first RFC series with minimal UAPI and miscdevice skeleton
-- v2: tracepoints and statistics
-- v3: backend experiments tied to CXL/DAX or migration paths
-- v4: runtime trace replay and proxy benchmarking
-- v5: policy, accounting, and cgroup discussion if the basic abstraction survives review
+- CXL Type-3 memory expander backend
+- DAX/kmem-backed warm nodes
+- Admission control with cost-benefit scoring
+- Anti-thrashing hysteresis
+- Cgroup per-tenant budgets
+- KV-cache trace-replay benchmark
+- API bake-off (madvise vs ioctl vs shared ring)
+- Prediction-quality sensitivity analysis
 
 ## References
 
-Key background documents are collected in [docs/references.md](docs/references.md), including:
-
-- Linux CXL documentation
-- Linux DAX documentation
-- Linux memory hotplug documentation
-- Linux NUMA and memory-tiering controls
-- Linux HMM documentation
-- Linux patch submission process documentation
+See [docs/references.md](docs/references.md) for upstream documentation links.

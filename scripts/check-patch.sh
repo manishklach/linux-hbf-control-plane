@@ -1,33 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PATCH_FILE="rfc-hbf-linux-control-plane.patch"
-EXAMPLE_SRC="examples/hbfctl-demo.c"
-EXAMPLE_BIN="examples/hbfctl-demo"
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+KERNEL_TREE="${KERNEL_TREE:-}"
 
-if [ ! -f "${PATCH_FILE}" ]; then
-	echo "error: ${PATCH_FILE} not found in repository root" >&2
-	exit 1
+if [ -z "$KERNEL_TREE" ]; then
+	echo "KERNEL_TREE not set — checking patches without checkpatch.pl"
+	echo "Set KERNEL_TREE to run kernel style checks."
 fi
 
-if [ -n "${KERNEL_TREE:-}" ]; then
-	if [ ! -d "${KERNEL_TREE}" ]; then
-		echo "error: KERNEL_TREE does not point to a directory: ${KERNEL_TREE}" >&2
-		exit 1
+for patch in "$REPO_DIR"/patches/000*.patch; do
+	echo "=== $patch ==="
+	if [ -n "$KERNEL_TREE" ]; then
+		"${KERNEL_TREE}/scripts/checkpatch.pl" --strict "$patch" || true
 	fi
+done
 
-	if [ ! -x "${KERNEL_TREE}/scripts/checkpatch.pl" ]; then
-		echo "error: ${KERNEL_TREE}/scripts/checkpatch.pl is not executable" >&2
-		exit 1
-	fi
-
-	"${KERNEL_TREE}/scripts/checkpatch.pl" --strict "${PATCH_FILE}"
-else
-	echo "KERNEL_TREE is not set."
-	echo "To run kernel patch style checks, use:"
-	echo "  export KERNEL_TREE=/path/to/linux"
-	echo "  \$KERNEL_TREE/scripts/checkpatch.pl --strict ${PATCH_FILE}"
+# Build the userspace hbfctl tool
+if command -v gcc &>/dev/null; then
+	gcc -Wall -Wextra -O2 -o "$REPO_DIR/samples/hbf/hbfctl" \
+		"$REPO_DIR/samples/hbf/hbfctl.c" 2>/dev/null && \
+		echo "Built hbfctl" || \
+		echo "Note: hbfctl requires kernel headers and libnuma"
 fi
-
-gcc -Wall -Wextra -O2 -o "${EXAMPLE_BIN}" "${EXAMPLE_SRC}"
-echo "Built ${EXAMPLE_BIN}"

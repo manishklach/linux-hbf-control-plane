@@ -1,0 +1,498 @@
+From 55853e9a22e17759afde993926c4402067fd6d69 Mon Sep 17 00:00:00 2001
+From: Manish KL <manishklach@gmail.com>
+Date: Fri, 10 Jul 2026 00:48:22 -0700
+Subject: [PATCH 7/7] samples: hbf: add hbfctl CLI tool and bpftrace
+ observability scripts
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+hbfctl CLI tool with subcommands:
+  submit  <addr> <len> -o <op> -n <nid> [-d deadline_ns] [-t tag]
+  query   <request_id>
+  cancel  <request_id>
+  caps
+  status  (reads debugfs stats)
+
+bpftrace-based observability tools:
+  hbf_latency.py       — submission-to-completion latency histograms
+  hbf_migrations.py    — per-node page migration counts and bandwidth
+  hbf_deadline_misses.py — deadline overrun distribution
+
+These scripts produce histograms from the hbf tracepoints for offline
+analysis.
+
+Signed-off-by: Manish KL <manishklach@gmail.com>
+---
+ samples/hbf/Makefile                  |   2 +
+ samples/hbf/hbfctl.c                  | 218 ++++++++++++++++++++++++++
+ tools/hbftrace/hbf_deadline_misses.py |  61 +++++++
+ tools/hbftrace/hbf_latency.py         |  70 +++++++++
+ tools/hbftrace/hbf_migrations.py      |  76 +++++++++
+ 5 files changed, 427 insertions(+)
+ create mode 100644 samples/hbf/Makefile
+ create mode 100644 samples/hbf/hbfctl.c
+ create mode 100644 tools/hbftrace/hbf_deadline_misses.py
+ create mode 100644 tools/hbftrace/hbf_latency.py
+ create mode 100644 tools/hbftrace/hbf_migrations.py
+
+diff --git a/samples/hbf/Makefile b/samples/hbf/Makefile
+new file mode 100644
+index 000000000..303fc16ef
+--- /dev/null
++++ b/samples/hbf/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_HBF_CONTROL_PLANE) += hbfctl.o
+diff --git a/samples/hbf/hbfctl.c b/samples/hbf/hbfctl.c
+new file mode 100644
+index 000000000..b416dce6c
+--- /dev/null
++++ b/samples/hbf/hbfctl.c
+@@ -0,0 +1,218 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <linux/ioctl.h>
++#include <linux/types.h>
++#include <linux/hbf.h>
++#include <numa.h>
++
++static const char *dev_path = "/dev/hbfctl";
++static int dev_fd = -1;
++
++static int open_device(void)
++{
++	if (dev_fd >= 0)
++		return 0;
++	dev_fd = open(dev_path, O_RDWR);
++	if (dev_fd < 0) {
++		perror("open /dev/hbfctl");
++		return -1;
++	}
++	return 0;
++}
++
++static void print_state(int state)
++{
++	static const char *states[] = {
++		[0]  = "SUBMITTED",
++		[1]  = "VALIDATED",
++		[2]  = "ADMITTED",
++		[3]  = "REJECTED",
++		[4]  = "QUEUED",
++		[5]  = "RUNNING",
++		[6]  = "FULL_SUCCESS",
++		[7]  = "PARTIAL_SUCCESS",
++		[8]  = "MISSED_DEADLINE",
++		[9]  = "CANCELLED",
++		[10] = "BACKEND_FAILURE",
++	};
++	if (state >= 0 && state < 11)
++		printf("%s", states[state]);
++	else
++		printf("UNKNOWN(%d)", state);
++}
++
++static int cmd_submit(int argc, char **argv)
++{
++	struct hbf_user_hint hint = { .version = 1 };
++	__u64 request_id;
++	int opt;
++
++	opterr = 0;
++	while ((opt = getopt(argc, argv, "o:n:d:t:")) != -1) {
++		switch (opt) {
++		case 'o':
++			hint.op = atoi(optarg);
++			break;
++		case 'n':
++			hint.target_nid = atoi(optarg);
++			break;
++		case 'd':
++			hint.deadline_ns = strtoull(optarg, NULL, 0);
++			break;
++		case 't':
++			hint.user_tag = strtoull(optarg, NULL, 0);
++			break;
++		default:
++			fprintf(stderr, "Usage: hbfctl submit <addr> <len> -o <op> -n <nid> [-d deadline_ns] [-t tag]\n");
++			return 1;
++		}
++	}
++
++	if (optind + 2 > argc) {
++		fprintf(stderr, "Missing addr/len arguments\n");
++		return 1;
++	}
++
++	hint.start = strtoull(argv[optind], NULL, 0);
++	hint.len = strtoull(argv[optind + 1], NULL, 0);
++
++	if (open_device() < 0)
++		return 1;
++
++	if (ioctl(dev_fd, HBF_IOC_SUBMIT, &hint) < 0) {
++		perror("HBF_IOC_SUBMIT");
++		return 1;
++	}
++
++	memcpy(&request_id, &hint, sizeof(request_id));
++	printf("%llu\n", request_id);
++	return 0;
++}
++
++static int cmd_query(int argc, char **argv)
++{
++	struct hbf_query_result result;
++	__u64 request_id;
++
++	if (argc < 1) {
++		fprintf(stderr, "Usage: hbfctl query <request_id>\n");
++		return 1;
++	}
++
++	request_id = strtoull(argv[0], NULL, 0);
++	result.request_id = request_id;
++
++	if (open_device() < 0)
++		return 1;
++
++	if (ioctl(dev_fd, HBF_IOC_QUERY, &result) < 0) {
++		perror("HBF_IOC_QUERY");
++		return 1;
++	}
++
++	printf("request_id:    %llu\n", result.request_id);
++	printf("state:         ");
++	print_state(result.state);
++	printf("\n");
++	printf("submit_ns:     %llu\n", result.submit_ns);
++	printf("start_ns:      %llu\n", result.start_ns);
++	printf("complete_ns:   %llu\n", result.complete_ns);
++	printf("pages_request: %llu\n", result.pages_requested);
++	printf("pages_process: %llu\n", result.pages_processed);
++	printf("pages_moved:   %llu\n", result.pages_moved);
++	printf("pages_failed:  %llu\n", result.pages_failed);
++	return 0;
++}
++
++static int cmd_cancel(int argc, char **argv)
++{
++	__u64 request_id;
++
++	if (argc < 1) {
++		fprintf(stderr, "Usage: hbfctl cancel <request_id>\n");
++		return 1;
++	}
++
++	request_id = strtoull(argv[0], NULL, 0);
++
++	if (open_device() < 0)
++		return 1;
++
++	if (ioctl(dev_fd, HBF_IOC_CANCEL, &request_id) < 0) {
++		perror("HBF_IOC_CANCEL");
++		return 1;
++	}
++
++	printf("cancelled: %llu\n", request_id);
++	return 0;
++}
++
++static int cmd_caps(int argc, char **argv)
++{
++	struct hbf_caps caps;
++
++	if (open_device() < 0)
++		return 1;
++
++	if (ioctl(dev_fd, HBF_IOC_CAPS, &caps) < 0) {
++		perror("HBF_IOC_CAPS");
++		return 1;
++	}
++
++	printf("max_request_bytes: %llu\n", caps.max_request_bytes);
++	printf("max_inflight:      %u\n", caps.max_inflight);
++	printf("supported_ops:     0x%x\n", caps.supported_ops);
++	printf("max_target_nodes:  %u\n", caps.max_target_nodes);
++	return 0;
++}
++
++static int cmd_status(int argc, char **argv)
++{
++	// Reads debugfs stats
++	FILE *f = fopen("/sys/kernel/debug/hbf/stats", "r");
++	char buf[256];
++
++	if (!f) {
++		perror("open debugfs stats");
++		return 1;
++	}
++
++	while (fgets(buf, sizeof(buf), f))
++		printf("%s", buf);
++
++	fclose(f);
++	return 0;
++}
++
++int main(int argc, char **argv)
++{
++	if (argc < 2) {
++		fprintf(stderr, "Usage: hbfctl <command> [args...]\n");
++		fprintf(stderr, "Commands:\n");
++		fprintf(stderr, "  submit  <addr> <len> -o <op> -n <nid> [-d deadline_ns] [-t tag]\n");
++		fprintf(stderr, "  query   <request_id>\n");
++		fprintf(stderr, "  cancel  <request_id>\n");
++		fprintf(stderr, "  caps\n");
++		fprintf(stderr, "  status\n");
++		return 1;
++	}
++
++	if (strcmp(argv[1], "submit") == 0)
++		return cmd_submit(argc - 2, argv + 2);
++	if (strcmp(argv[1], "query") == 0)
++		return cmd_query(argc - 2, argv + 2);
++	if (strcmp(argv[1], "cancel") == 0)
++		return cmd_cancel(argc - 2, argv + 2);
++	if (strcmp(argv[1], "caps") == 0)
++		return cmd_caps(argc - 2, argv + 2);
++	if (strcmp(argv[1], "status") == 0)
++		return cmd_status(argc - 2, argv + 2);
++
++	fprintf(stderr, "Unknown command: %s\n", argv[1]);
++	return 1;
++}
+diff --git a/tools/hbftrace/hbf_deadline_misses.py b/tools/hbftrace/hbf_deadline_misses.py
+new file mode 100644
+index 000000000..138fe56f2
+--- /dev/null
++++ b/tools/hbftrace/hbf_deadline_misses.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0
++"""hbf_deadline_misses.py - Report HBF deadline miss statistics.
++
++Tracks hbf_deadline_miss events and reports overruns per process and request.
++
++Usage:
++    sudo ./hbf_deadline_misses.py [duration_sec]
++"""
++
++import subprocess
++import sys
++
++duration = int(sys.argv[1]) if len(sys.argv) > 1 else 30
++
++script = r"""
++#!/usr/bin/bpftrace
++
++BEGIN
++{
++    printf("Tracing HBF deadline misses for %d seconds...\n", %d);
++}
++
++tracepoint:hbf:hbf_deadline_miss
++{
++    @misses = count();
++    @overrun_ns = hist(args->overrun_ns);
++    @overrun_us = hist(args->overrun_ns / 1000);
++    @overrun_ms = hist(args->overrun_ns / 1000000);
++}
++
++tracepoint:hbf:hbf_hint_complete
++{
++    if (args->state == 8) {
++        @missed_by_op = count();
++    }
++}
++
++interval:s:%d
++{
++    exit();
++}
++
++END
++{
++    printf("\n=== Total deadline misses: %d ===\n", @misses);
++    printf("\n=== Overrun (ns) ===\n");
++    print(@overrun_ns);
++    printf("\n=== Overrun (us) ===\n");
++    print(@overrun_us);
++    printf("\n=== Overrun (ms) ===\n");
++    print(@overrun_ms);
++    clear(@misses);
++}
++""" % (duration, duration)
++
++proc = subprocess.run(["bpftrace", "-e", script],
++                      capture_output=True, text=True)
++print(proc.stdout)
++if proc.stderr:
++    print("stderr:", proc.stderr, file=sys.stderr)
+diff --git a/tools/hbftrace/hbf_latency.py b/tools/hbftrace/hbf_latency.py
+new file mode 100644
+index 000000000..a2667cfed
+--- /dev/null
++++ b/tools/hbftrace/hbf_latency.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0
++"""hbf_latency.py - Trace HBF hint submission-to-completion latency.
++
++Uses bpftrace to capture hbf_hint_submit and hbf_hint_complete events
++and produces a latency histogram.
++
++Usage:
++    sudo ./hbf_latency.py [duration_sec]
++"""
++
++import subprocess
++import sys
++
++duration = int(sys.argv[1]) if len(sys.argv) > 1 else 30
++
++script = r"""
++#!/usr/bin/bpftrace
++
++BEGIN
++{
++    printf("Tracing HBF hint latency for %d seconds...\n", %d);
++}
++
++tracepoint:hbf:hbf_hint_submit
++{
++    @submit[args->request_id] = nsecs;
++}
++
++tracepoint:hbf:hbf_hint_complete
++{
++    $start = @submit[args->request_id];
++    if ($start > 0) {
++        $lat = nsecs - $start;
++        @latency_ns = hist($lat);
++        @latency_us = hist($lat / 1000);
++        @latency_ms = hist($lat / 1000000);
++        delete(@submit[args->request_id]);
++    }
++}
++
++tracepoint:hbf:hbf_deadline_miss
++{
++    @deadline_misses = count();
++}
++
++interval:s:%d
++{
++    exit();
++}
++
++END
++{
++    printf("\n=== Latency (ns) ===\n");
++    print(@latency_ns);
++    printf("\n=== Latency (us) ===\n");
++    print(@latency_us);
++    printf("\n=== Latency (ms) ===\n");
++    print(@latency_ms);
++    printf("\n=== Deadline misses ===\n");
++    print(@deadline_misses);
++    clear(@submit);
++}
++""" % (duration, duration)
++
++proc = subprocess.run(["bpftrace", "-e", script],
++                      capture_output=True, text=True)
++print(proc.stdout)
++if proc.stderr:
++    print("stderr:", proc.stderr, file=sys.stderr)
+diff --git a/tools/hbftrace/hbf_migrations.py b/tools/hbftrace/hbf_migrations.py
+new file mode 100644
+index 000000000..58fa7a511
+--- /dev/null
++++ b/tools/hbftrace/hbf_migrations.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0
++"""hbf_migrations.py - Count and measure HBF page migrations.
++
++Tracks hbf_page_move events to report total pages moved, bandwidth,
++and per-node migration counts.
++
++Usage:
++    sudo ./hbf_migrations.py [duration_sec]
++"""
++
++import subprocess
++import sys
++
++duration = int(sys.argv[1]) if len(sys.argv) > 1 else 30
++
++script = r"""
++#!/usr/bin/bpftrace
++
++BEGIN
++{
++    printf("Tracing HBF page migrations for %d seconds...\n", %d);
++}
++
++tracepoint:hbf:hbf_page_move
++{
++    @total_moves = count();
++    @successful = sum(args->success == 1 ? 1 : 0);
++    @failed = sum(args->success == 0 ? 1 : 0);
++    @by_src[args->src_nid] = count();
++    @by_dst[args->dst_nid] = count();
++    @by_pair[str(args->src_nid) + "->" + str(args->dst_nid)] = count();
++}
++
++tracepoint:hbf:hbf_hint_start
++{
++    @start_ns[args->request_id] = nsecs;
++}
++
++tracepoint:hbf:hbf_hint_complete
++{
++    $start = @start_ns[args->request_id];
++    if ($start > 0) {
++        $dur = nsecs - $start;
++        @migration_dur_ns = hist($dur);
++        if (args->pages_moved > 0) {
++            @bytes_moved = sum(args->pages_moved * 4096);
++        }
++        delete(@start_ns[args->request_id]);
++    }
++}
++
++interval:s:%d
++{
++    exit();
++}
++
++END
++{
++    printf("\n=== Total page moves: %d ===\n", @total_moves);
++    printf("Successful: %d  Failed: %d\n", @successful, @failed);
++    printf("\n=== By source node ===\n");
++    print(@by_src);
++    printf("\n=== By destination node ===\n");
++    print(@by_dst);
++    printf("\n=== Migration duration (ns) ===\n");
++    print(@migration_dur_ns);
++    clear(@start_ns);
++}
++""" % (duration, duration)
++
++proc = subprocess.run(["bpftrace", "-e", script],
++                      capture_output=True, text=True)
++print(proc.stdout)
++if proc.stderr:
++    print("stderr:", proc.stderr, file=sys.stderr)
+-- 
+2.43.0
+
